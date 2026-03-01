@@ -1,0 +1,4933 @@
+From fc3952aaa43a75b5c19e77ed2802c3710c7cc910 Mon Sep 17 00:00:00 2001
+From: financecommander <financecommander@calculus.holdings>
+Date: Sun, 1 Mar 2026 07:57:13 +0000
+Subject: [PATCH] feat: full TILT lead engine with 6-step pipeline + deep
+ enrichment
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Pipeline: Ingest → AI Classify → Qualify → Score → Deep Enrich → GHL Push
+
+Core modules:
+- lead_engine/score_and_push.py: 6-step pipeline orchestrator
+- lead_engine/qualify.py: $2M-$100M filter, 4 deal tiers (SMALL/CORE/LARGE/INSTITUTIONAL)
+- lead_engine/scoring.py: 5-dimension composite scoring (0-100, T1-T4)
+
+Enrichment (5 layers, ~$0.32/lead):
+- enrichment/entity_resolution: CT/MA/RI/FL/TX SOS + OpenCorporates + Grok AI
+- enrichment/skip_trace: BatchSkip + PropStream + REISkip + free lookup + DNC
+- enrichment/property_data: ATTOM API (owner, mortgage, equity, market value)
+- enrichment/news_intel: Google News + court records + zoning/litigation flags
+- enrichment/contractor_intel: Cross-permit GC reverse lookup
+
+GHL Integration:
+- ghl_integration/client.py: Contact upsert with skip trace phone/email
+- 60+ custom fields: scoring, entity, skip trace, property, news, contractor
+- Tags: tier, source, has-contact-info, dnc-verified
+
+Permit Ingestion:
+- openshovels/schema.py: StandardPermit + EnrichmentBundle Pydantic models
+- openshovels/jurisdictions/ct_hartford: ArcGIS Hub scraper (34K records)
+- openshovels/pipeline/enrich.py: Grok AI bulk classification
+---
+ .gitignore                                    |   9 +
+ README.md                                     |  61 ++-
+ config/.env.example                           |  32 ++
+ config/jurisdictions.py                       | 318 +++++++++++
+ enrichment/__init__.py                        |   0
+ enrichment/contractor_intel/__init__.py       |   0
+ enrichment/contractor_intel/reverse_lookup.py | 157 ++++++
+ enrichment/entity_resolution/__init__.py      |   0
+ enrichment/entity_resolution/resolver.py      | 437 +++++++++++++++
+ enrichment/news_intel/__init__.py             |   0
+ enrichment/news_intel/search.py               | 257 +++++++++
+ enrichment/orchestrator.py                    | 251 +++++++++
+ enrichment/property_data/__init__.py          |   0
+ enrichment/property_data/attom.py             | 244 +++++++++
+ enrichment/skip_trace/__init__.py             |   0
+ enrichment/skip_trace/tracer.py               | 442 +++++++++++++++
+ ghl_integration/__init__.py                   |   0
+ ghl_integration/client.py                     | 502 ++++++++++++++++++
+ lead_engine/__init__.py                       |   0
+ lead_engine/qualify.py                        | 163 ++++++
+ lead_engine/score_and_push.py                 | 416 +++++++++++++++
+ lead_engine/scoring.py                        | 325 ++++++++++++
+ openshovels/__init__.py                       |   0
+ openshovels/api/__init__.py                   |   0
+ openshovels/ingest/__init__.py                |   0
+ openshovels/jurisdictions/__init__.py         |   0
+ .../jurisdictions/ct_hartford/__init__.py     |   0
+ .../jurisdictions/ct_hartford/scraper.py      | 201 +++++++
+ .../jurisdictions/template/__init__.py        |   0
+ openshovels/jurisdictions/template/base.py    |  87 +++
+ openshovels/pipeline/__init__.py              |   0
+ openshovels/pipeline/enrich.py                | 170 ++++++
+ openshovels/schema.py                         | 261 +++++++++
+ openshovels/storage/__init__.py               |   0
+ openshovels/utils/__init__.py                 |   0
+ requirements.txt                              |  32 ++
+ scripts/__init__.py                           |   0
+ scripts/setup_ghl.py                          | 282 ++++++++++
+ 38 files changed, 4645 insertions(+), 2 deletions(-)
+ create mode 100644 .gitignore
+ create mode 100644 config/.env.example
+ create mode 100644 config/jurisdictions.py
+ create mode 100644 enrichment/__init__.py
+ create mode 100644 enrichment/contractor_intel/__init__.py
+ create mode 100644 enrichment/contractor_intel/reverse_lookup.py
+ create mode 100644 enrichment/entity_resolution/__init__.py
+ create mode 100644 enrichment/entity_resolution/resolver.py
+ create mode 100644 enrichment/news_intel/__init__.py
+ create mode 100644 enrichment/news_intel/search.py
+ create mode 100644 enrichment/orchestrator.py
+ create mode 100644 enrichment/property_data/__init__.py
+ create mode 100644 enrichment/property_data/attom.py
+ create mode 100644 enrichment/skip_trace/__init__.py
+ create mode 100644 enrichment/skip_trace/tracer.py
+ create mode 100644 ghl_integration/__init__.py
+ create mode 100644 ghl_integration/client.py
+ create mode 100644 lead_engine/__init__.py
+ create mode 100644 lead_engine/qualify.py
+ create mode 100644 lead_engine/score_and_push.py
+ create mode 100644 lead_engine/scoring.py
+ create mode 100644 openshovels/__init__.py
+ create mode 100644 openshovels/api/__init__.py
+ create mode 100644 openshovels/ingest/__init__.py
+ create mode 100644 openshovels/jurisdictions/__init__.py
+ create mode 100644 openshovels/jurisdictions/ct_hartford/__init__.py
+ create mode 100644 openshovels/jurisdictions/ct_hartford/scraper.py
+ create mode 100644 openshovels/jurisdictions/template/__init__.py
+ create mode 100644 openshovels/jurisdictions/template/base.py
+ create mode 100644 openshovels/pipeline/__init__.py
+ create mode 100644 openshovels/pipeline/enrich.py
+ create mode 100644 openshovels/schema.py
+ create mode 100644 openshovels/storage/__init__.py
+ create mode 100644 openshovels/utils/__init__.py
+ create mode 100644 requirements.txt
+ create mode 100644 scripts/__init__.py
+ create mode 100644 scripts/setup_ghl.py
+
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..cc206b8
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,9 @@
++config/.env
++*.pyc
++__pycache__/
++.venv/
++*.egg-info/
++dist/
++build/
++.local/
++.npm-global/
+diff --git a/README.md b/README.md
+index 990205e..a0e3ad9 100644
+--- a/README.md
++++ b/README.md
+@@ -1,2 +1,59 @@
+-# REAL-ESTATE-LEAD-GEN
+-REAL ESTATE LEAD GEN
++# TILT Construction Lead Engine
++
++**Permit Data → AI Scoring → Deep Enrichment → Contact Discovery → GoHighLevel CRM**
++
++Automated construction lending lead generation engine that ingests building permits from public open data portals, scores them against TILT lending criteria, enriches qualified leads with entity resolution and skip tracing, and pushes actionable contacts into GoHighLevel for sales outreach.
++
++## Architecture
++
++```
++┌─────────────────────────────────────────────────────────────────┐
++│                    TILT LEAD ENGINE PIPELINE                     │
++├─────────────────────────────────────────────────────────────────┤
++│                                                                 │
++│  1. INGEST          Scrape permits from jurisdiction portals    │
++│       ↓             (ArcGIS, Socrata, CSV open data)            │
++│  2. AI CLASSIFY     Grok AI: project type, NOO, value est.     │
++│       ↓             ($0.002/permit)                              │
++│  3. QUALIFY         Filter: $2M-$100M, 4 deal tiers             │
++│       ↓             SMALL / CORE / LARGE / INSTITUTIONAL        │
++│  4. SCORE           5-dimension composite scoring (0-100)       │
++│       ↓             T1 HOT → T2 WARM → T3 NURTURE → T4 MONITOR │
++│  5. DEEP ENRICH     Entity, Skip Trace, Property, News, GC     │
++│       ↓             (~$0.32/lead for T1-T3)                     │
++│  6. GHL PUSH        Contact + Opportunity + 60+ custom fields  │
++│                                                                 │
++└─────────────────────────────────────────────────────────────────┘
++```
++
++## Usage
++
++```bash
++# Full pipeline with enrichment
++python lead_engine/score_and_push.py -j ct_hartford --since 2024-01-01
++
++# Dry run (score + enrich but skip GHL push)
++python lead_engine/score_and_push.py -j ct_hartford --dry-run
++
++# Skip deep enrichment (scoring only)
++python lead_engine/score_and_push.py -j ct_hartford --skip-enrichment
++
++# Only entity resolution + skip trace
++python lead_engine/score_and_push.py -j ct_hartford --enrich-layers entity,skip_trace
++
++# Limit permits processed
++python lead_engine/score_and_push.py -j ct_hartford --limit 100
++
++# Scheduled mode (every 15 minutes)
++python lead_engine/score_and_push.py --scheduled
++```
++
++## Setup
++
++```bash
++pip install -r requirements.txt
++cp config/.env.example config/.env
++# Edit config/.env with API keys
++```
++
++## Calculus Holdings LLC — Confidential
+diff --git a/config/.env.example b/config/.env.example
+new file mode 100644
+index 0000000..d31fd15
+--- /dev/null
++++ b/config/.env.example
+@@ -0,0 +1,32 @@
++# === TILT Lead Engine Configuration ===
++
++# AI Classification (required)
++GROK_API_KEY=your_grok_api_key
++GROK_MODEL=grok-3-mini
++
++# GoHighLevel CRM (required)
++GHL_PRIVATE_TOKEN=your_ghl_private_integration_token
++GHL_LOCATION_ID=your_ghl_location_id
++GHL_PIPELINE_ID=your_pipeline_id
++
++# GHL Pipeline Stage IDs
++GHL_STAGE_PERMIT_DETECTED=
++GHL_STAGE_QUALIFIED=
++GHL_STAGE_CONTACTED=
++GHL_STAGE_ENGAGED=
++GHL_STAGE_APPLICATION=
++GHL_STAGE_UNDERWRITING=
++GHL_STAGE_APPROVED=
++GHL_STAGE_FUNDED=
++
++# Deep Enrichment (optional - skip trace + entity resolution)
++OPENCORPORATES_API_KEY=
++BATCH_SKIP_API_KEY=
++PROPSTREAM_API_KEY=
++REISKIP_API_KEY=
++ATTOM_API_KEY=
++GOOGLE_NEWS_API_KEY=
++
++# Pipeline Settings
++TARGET_JURISDICTIONS=ct_hartford
++SCORING_INTERVAL_SECONDS=900
+diff --git a/config/jurisdictions.py b/config/jurisdictions.py
+new file mode 100644
+index 0000000..4ae737a
+--- /dev/null
++++ b/config/jurisdictions.py
+@@ -0,0 +1,318 @@
++"""
++Jurisdiction Registry — All Target Markets
++New England (CT, MA, RI, NH, ME, VT) + Florida + Texas
++
++Each entry maps to a data source (ArcGIS, Socrata, CKAN, CSV) with
++API endpoints, field mappings, and scraper configuration.
++"""
++
++JURISDICTIONS = {
++    # ═══════════════════════════════════════════════════════════════════
++    # CONNECTICUT
++    # ═══════════════════════════════════════════════════════════════════
++    "ct_hartford": {
++        "name": "Hartford, CT",
++        "state": "CT",
++        "county": "Hartford County",
++        "platform": "arcgis",
++        "endpoints": {
++            "primary": "https://services1.arcgis.com/XBhYkoXKJCRHbe7M/arcgis/rest/services/Building_Permits_20200101_to_Current/FeatureServer/0/query",
++            "geojson": "https://open-data-hartford-hartfordgis.hub.arcgis.com/api/v3/datasets/d595ae995fb049d3ac54919ebf24b1ac/downloads/data?format=geojson",
++            "csv": "https://data.hartford.gov/api/download/v1/items/d595ae995fb049d3ac54919ebf24b1ac/csv",
++        },
++        "status": "active",
++        "record_count_approx": 34000,
++    },
++    "ct_new_haven": {
++        "name": "New Haven, CT",
++        "state": "CT",
++        "county": "New Haven County",
++        "platform": "arcgis",
++        "endpoints": {
++            "primary": "https://data.newhavenct.gov/api/v2/catalog",
++            "search": "https://data.newhavenct.gov/resource/permits.json",
++        },
++        "status": "pending_endpoint_discovery",
++    },
++    "ct_bridgeport": {
++        "name": "Bridgeport, CT",
++        "state": "CT",
++        "county": "Fairfield County",
++        "platform": "viewpoint",
++        "endpoints": {
++            "primary": "https://bridgeportct.viewpointcloud.com/",
++        },
++        "status": "pending_scraper",
++        "notes": "ViewPoint Cloud platform — needs API discovery or scraping",
++    },
++    "ct_stamford": {
++        "name": "Stamford, CT",
++        "state": "CT",
++        "county": "Fairfield County",
++        "platform": "html_scrape",
++        "endpoints": {
++            "primary": "https://www.stamfordct.gov/building-department",
++        },
++        "status": "pending_scraper",
++    },
++
++    # ═══════════════════════════════════════════════════════════════════
++    # MASSACHUSETTS
++    # ═══════════════════════════════════════════════════════════════════
++    "ma_boston": {
++        "name": "Boston, MA",
++        "state": "MA",
++        "county": "Suffolk County",
++        "platform": "ckan",
++        "endpoints": {
++            "primary": "https://data.boston.gov/api/3/action/datastore_search",
++            "csv_download": "https://data.boston.gov/dataset/cd1ec3ff-6ebf-4a65-af68-8329eceab740/resource/6ddcd912-32a0-43df-9908-63574f8c7e77/download/tmppcwb6msr.csv",
++            "resource_id": "6ddcd912-32a0-43df-9908-63574f8c7e77",
++        },
++        "field_mapping": {
++            "permit_id": "PermitNumber",
++            "description": "DESCRIPTION",
++            "address": "ADDRESS",
++            "city": "CITY",
++            "state": "STATE",
++            "zip_code": "ZIP",
++            "permit_type": "WORKTYPE",
++            "permit_status": "STATUS",
++            "issued_date": "ISSUED_DATE",
++            "expiration_date": "EXPIRATION_DATE",
++            "job_value": "DECLARED_VALUATION",
++            "owner_name": "APPLICANT",
++            "contractor_name": "APPLICANT",  # Boston uses same field
++            "occupancy": "OCCUPANCYTYPE",
++        },
++        "status": "active",
++        "record_count_approx": 609000,
++    },
++    "ma_worcester": {
++        "name": "Worcester, MA",
++        "state": "MA",
++        "county": "Worcester County",
++        "platform": "html_scrape",
++        "endpoints": {
++            "primary": "https://www.worcesterma.gov/inspectional-services",
++        },
++        "status": "pending_scraper",
++    },
++    "ma_springfield": {
++        "name": "Springfield, MA",
++        "state": "MA",
++        "county": "Hampden County",
++        "platform": "html_scrape",
++        "endpoints": {
++            "primary": "https://www.springfield-ma.gov/planning/",
++        },
++        "status": "pending_scraper",
++    },
++
++    # ═══════════════════════════════════════════════════════════════════
++    # RHODE ISLAND
++    # ═══════════════════════════════════════════════════════════════════
++    "ri_providence": {
++        "name": "Providence, RI",
++        "state": "RI",
++        "county": "Providence County",
++        "platform": "socrata",
++        "endpoints": {
++            "primary": "https://data.providenceri.gov/resource/permits.json",
++            "portal": "https://data.providenceri.gov/",
++            "viewpoint": "https://providenceri.viewpointcloud.com/",
++        },
++        "status": "pending_endpoint_discovery",
++        "notes": "Socrata portal exists but need to confirm building permit dataset ID",
++    },
++
++    # ═══════════════════════════════════════════════════════════════════
++    # NEW HAMPSHIRE
++    # ═══════════════════════════════════════════════════════════════════
++    "nh_manchester": {
++        "name": "Manchester, NH",
++        "state": "NH",
++        "county": "Hillsborough County",
++        "platform": "html_scrape",
++        "endpoints": {
++            "primary": "https://www.manchesternh.gov/Departments/Building",
++        },
++        "status": "pending_scraper",
++    },
++
++    # ═══════════════════════════════════════════════════════════════════
++    # MAINE
++    # ═══════════════════════════════════════════════════════════════════
++    "me_portland": {
++        "name": "Portland, ME",
++        "state": "ME",
++        "county": "Cumberland County",
++        "platform": "arcgis",
++        "endpoints": {
++            "primary": "https://portlandme-portal.opendata.arcgis.com/",
++            "search": "https://services1.arcgis.com/",
++        },
++        "status": "pending_endpoint_discovery",
++    },
++
++    # ═══════════════════════════════════════════════════════════════════
++    # VERMONT
++    # ═══════════════════════════════════════════════════════════════════
++    "vt_burlington": {
++        "name": "Burlington, VT",
++        "state": "VT",
++        "county": "Chittenden County",
++        "platform": "html_scrape",
++        "endpoints": {
++            "primary": "https://www.burlingtonvt.gov/DPI/Building-Permits",
++        },
++        "status": "pending_scraper",
++    },
++
++    # ═══════════════════════════════════════════════════════════════════
++    # FLORIDA
++    # ═══════════════════════════════════════════════════════════════════
++    "fl_miami_dade": {
++        "name": "Miami-Dade County, FL",
++        "state": "FL",
++        "county": "Miami-Dade County",
++        "platform": "arcgis",
++        "endpoints": {
++            "primary": "https://gis-mdc.opendata.arcgis.com/datasets/MDC::building-permit/api",
++            "feature_server": "https://gisfs.miamidade.gov/arcgis/rest/services/MD_BuildingPermit/FeatureServer/0/query",
++            "geojson": "https://opendata.miamidade.gov/api/v3/datasets/building-permit/downloads/data?format=geojson",
++        },
++        "status": "active",
++        "record_count_approx": 500000,
++        "notes": "ArcGIS Hub — 3 years of data, updated regularly",
++    },
++    "fl_broward": {
++        "name": "Broward County, FL",
++        "state": "FL",
++        "county": "Broward County",
++        "platform": "arcgis",
++        "endpoints": {
++            "primary": "https://gis.broward.org/arcgis/rest/services/",
++            "portal": "https://opendata.broward.org/",
++        },
++        "status": "pending_endpoint_discovery",
++    },
++    "fl_orlando": {
++        "name": "Orlando, FL",
++        "state": "FL",
++        "county": "Orange County",
++        "platform": "socrata",
++        "endpoints": {
++            "primary": "https://data.cityoforlando.net/resource/permits.json",
++            "portal": "https://data.cityoforlando.net/",
++        },
++        "status": "pending_endpoint_discovery",
++    },
++    "fl_tampa": {
++        "name": "Tampa, FL",
++        "state": "FL",
++        "county": "Hillsborough County",
++        "platform": "socrata",
++        "endpoints": {
++            "primary": "https://data.tampagov.net/resource/permits.json",
++            "portal": "https://data.tampagov.net/",
++        },
++        "status": "pending_endpoint_discovery",
++    },
++    "fl_jacksonville": {
++        "name": "Jacksonville, FL",
++        "state": "FL",
++        "county": "Duval County",
++        "platform": "arcgis",
++        "endpoints": {
++            "primary": "https://maps.coj.net/arcgis/rest/services/",
++            "portal": "https://data.coj.net/",
++        },
++        "status": "pending_endpoint_discovery",
++    },
++
++    # ═══════════════════════════════════════════════════════════════════
++    # TEXAS
++    # ═══════════════════════════════════════════════════════════════════
++    "tx_houston": {
++        "name": "Houston, TX",
++        "state": "TX",
++        "county": "Harris County",
++        "platform": "socrata",
++        "endpoints": {
++            "primary": "https://data.houstontx.gov/resource/permits.json",
++            "portal": "https://data.houstontx.gov/",
++            "sold_permits": "https://www.houstonpermittingcenter.org/",
++        },
++        "status": "pending_endpoint_discovery",
++        "notes": "Monthly XLSX reports also available at houstontx.gov",
++    },
++    "tx_dallas": {
++        "name": "Dallas, TX",
++        "state": "TX",
++        "county": "Dallas County",
++        "platform": "socrata",
++        "endpoints": {
++            "primary": "https://www.dallasopendata.com/resource/permits.json",
++            "portal": "https://www.dallasopendata.com/",
++        },
++        "status": "pending_endpoint_discovery",
++    },
++    "tx_austin": {
++        "name": "Austin, TX",
++        "state": "TX",
++        "county": "Travis County",
++        "platform": "socrata",
++        "endpoints": {
++            "primary": "https://data.austintexas.gov/resource/3syk-w9eu.json",
++            "portal": "https://data.austintexas.gov/",
++        },
++        "field_mapping": {
++            "permit_id": "permit_number",
++            "description": "description",
++            "address": "original_address1",
++            "permit_type": "permit_type_desc",
++            "permit_status": "status_current",
++            "issued_date": "issued_date",
++            "job_value": "total_job_valuation",
++            "contractor_name": "contractor_company_desc",
++            "applicant": "applicant_full_name",
++        },
++        "status": "active",
++        "record_count_approx": 400000,
++        "notes": "Well-structured Socrata dataset with good field coverage",
++    },
++    "tx_san_antonio": {
++        "name": "San Antonio, TX",
++        "state": "TX",
++        "county": "Bexar County",
++        "platform": "arcgis",
++        "endpoints": {
++            "primary": "https://data.sanantonio.gov/",
++        },
++        "status": "pending_endpoint_discovery",
++    },
++}
++
++
++def get_active_jurisdictions() -> list[str]:
++    """Return jurisdiction codes with active scrapers."""
++    return [
++        code for code, config in JURISDICTIONS.items()
++        if config.get("status") == "active"
++    ]
++
++
++def get_jurisdiction_config(code: str) -> dict:
++    """Get configuration for a specific jurisdiction."""
++    if code not in JURISDICTIONS:
++        raise ValueError(f"Unknown jurisdiction: {code}")
++    return JURISDICTIONS[code]
++
++
++def get_jurisdictions_by_state(state: str) -> list[str]:
++    """Get all jurisdiction codes for a given state."""
++    return [
++        code for code, config in JURISDICTIONS.items()
++        if config.get("state") == state.upper()
++    ]
+diff --git a/enrichment/__init__.py b/enrichment/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/enrichment/contractor_intel/__init__.py b/enrichment/contractor_intel/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/enrichment/contractor_intel/reverse_lookup.py b/enrichment/contractor_intel/reverse_lookup.py
+new file mode 100644
+index 0000000..ab664db
+--- /dev/null
++++ b/enrichment/contractor_intel/reverse_lookup.py
+@@ -0,0 +1,157 @@
++"""
++Layer 5: Contractor Intelligence
++Reverse lookup: find all other permits by the same contractor.
++Identifies referral potential and pipeline intelligence.
++"""
++from datetime import datetime
++from decimal import Decimal
++from typing import Optional
++
++from loguru import logger
++
++from openshovels.schema import ContractorProfile, StandardPermit
++
++
++class ContractorIntel:
++    """
++    Contractor reverse lookup engine.
++    
++    Given a contractor name from a permit, finds:
++    - All other active permits by that contractor
++    - Total pipeline value
++    - Other entity clients (potential borrowers)
++    - Referral potential scoring
++    """
++
++    def __init__(self):
++        # In-memory permit index by contractor name
++        # In production this would be a database query
++        self._contractor_index: dict[str, list[dict]] = {}
++
++    def index_permits(self, permits: list[StandardPermit]):
++        """Build contractor index from a batch of permits."""
++        for permit in permits:
++            if not permit.contractor_name:
++                continue
++
++            key = permit.contractor_name.lower().strip()
++            if key not in self._contractor_index:
++                self._contractor_index[key] = []
++
++            self._contractor_index[key].append({
++                "permit_id": permit.permit_id,
++                "jurisdiction": permit.jurisdiction,
++                "address": permit.address,
++                "city": permit.city,
++                "state": permit.state,
++                "owner_entity": permit.owner_entity or permit.owner_name or "",
++                "job_value": float(permit.job_value) if permit.job_value else 0,
++                "ai_value": float(permit.ai_value_estimated) if permit.ai_value_estimated else 0,
++                "project_type": permit.ai_project_classification.value if permit.ai_project_classification else "unknown",
++                "permit_status": permit.permit_status.value,
++                "filed_date": str(permit.filed_date) if permit.filed_date else "",
++                "issued_date": str(permit.issued_date) if permit.issued_date else "",
++            })
++
++        logger.info(
++            f"Indexed {sum(len(v) for v in self._contractor_index.values())} permits "
++            f"across {len(self._contractor_index)} contractors"
++        )
++
++    def lookup(self, contractor_name: str) -> Optional[ContractorProfile]:
++        """
++        Look up a contractor's full profile from the permit index.
++        """
++        if not contractor_name:
++            return None
++
++        key = contractor_name.lower().strip()
++        permits = self._contractor_index.get(key, [])
++
++        if not permits:
++            # Try fuzzy match
++            for idx_key in self._contractor_index:
++                if key in idx_key or idx_key in key:
++                    permits = self._contractor_index[idx_key]
++                    break
++
++        if not permits:
++            return None
++
++        # Calculate stats
++        total_value = sum(
++            max(p.get("ai_value", 0), p.get("job_value", 0))
++            for p in permits
++        )
++
++        # Unique jurisdictions
++        jurisdictions = list(set(p["jurisdiction"] for p in permits))
++
++        # Other clients (unique entity names)
++        clients = list(set(
++            p["owner_entity"] for p in permits
++            if p["owner_entity"]
++        ))
++
++        # Recent projects (most recent first)
++        recent = sorted(
++            permits,
++            key=lambda p: p.get("issued_date", p.get("filed_date", "")),
++            reverse=True,
++        )[:10]
++
++        # Referral potential
++        referral = self._score_referral_potential(permits, clients)
++
++        return ContractorProfile(
++            contractor_name=contractor_name,
++            active_permits_count=len(permits),
++            total_permit_value=Decimal(str(total_value)) if total_value else None,
++            jurisdictions_active=jurisdictions,
++            recent_projects=[{
++                "address": p["address"],
++                "city": p["city"],
++                "value": max(p.get("ai_value", 0), p.get("job_value", 0)),
++                "type": p["project_type"],
++                "date": p.get("issued_date") or p.get("filed_date", ""),
++                "owner": p["owner_entity"],
++            } for p in recent],
++            other_clients=clients[:20],
++            referral_potential=referral,
++            lookup_timestamp=datetime.now(),
++        )
++
++    def _score_referral_potential(
++        self, permits: list[dict], clients: list[str]
++    ) -> str:
++        """
++        Score contractor's referral potential based on activity.
++        
++        HIGH: 5+ active permits, $5M+ pipeline, 3+ unique clients
++        MEDIUM: 2-4 permits, $1-5M pipeline, 2+ clients
++        LOW: 1 permit or <$1M pipeline
++        """
++        total_value = sum(
++            max(p.get("ai_value", 0), p.get("job_value", 0))
++            for p in permits
++        )
++
++        if len(permits) >= 5 and total_value >= 5_000_000 and len(clients) >= 3:
++            return "high"
++        elif len(permits) >= 2 and total_value >= 1_000_000 and len(clients) >= 2:
++            return "medium"
++        else:
++            return "low"
++
++    def get_top_contractors(self, min_permits: int = 3) -> list[ContractorProfile]:
++        """Get top contractors by permit volume for referral targeting."""
++        profiles = []
++        for name_key, permits in self._contractor_index.items():
++            if len(permits) >= min_permits:
++                profile = self.lookup(permits[0].get("contractor_name", name_key))
++                if profile:
++                    profiles.append(profile)
++
++        # Sort by permit count descending
++        profiles.sort(key=lambda p: p.active_permits_count, reverse=True)
++        return profiles[:50]
+diff --git a/enrichment/entity_resolution/__init__.py b/enrichment/entity_resolution/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/enrichment/entity_resolution/resolver.py b/enrichment/entity_resolution/resolver.py
+new file mode 100644
+index 0000000..784f83a
+--- /dev/null
++++ b/enrichment/entity_resolution/resolver.py
+@@ -0,0 +1,437 @@
++"""
++Layer 1: Entity Resolution
++Secretary of State lookups for CT, MA, RI, NH, ME, VT, FL, TX + OpenCorporates fallback.
++Resolves LLC/Corp names from permits to registered agents and principals.
++"""
++import os
++import re
++import json
++from datetime import datetime
++from typing import Optional
++
++import httpx
++from loguru import logger
++
++from openshovels.schema import EntityRecord
++
++
++# ── State SOS Endpoints ───────────────────────────────────────────────
++# Each state has different APIs/scraping requirements
++
++SOS_ENDPOINTS = {
++    # Connecticut - CONCORD system
++    "CT": {
++        "search_url": "https://service.ct.gov/business/s/onlinebusinesssearch",
++        "api_url": "https://service.ct.gov/business/s/sfsites/aura",
++        "method": "concord_api",
++    },
++    # Massachusetts - Corporations Division
++    "MA": {
++        "search_url": "https://corp.sec.state.ma.us/CorpWeb/CorpSearch/CorpSearch.aspx",
++        "api_url": "https://corp.sec.state.ma.us/CorpWeb/CorpSearch/CorpSearchResults.aspx",
++        "method": "ma_scrape",
++    },
++    # Rhode Island - Business Search
++    "RI": {
++        "search_url": "https://business.sos.ri.gov/CorpWeb/CorpSearch/CorpSearch.aspx",
++        "api_url": "https://business.sos.ri.gov/CorpWeb/CorpSearch/CorpSearchResults.aspx",
++        "method": "ri_scrape",
++    },
++    # New Hampshire
++    "NH": {
++        "search_url": "https://quickstart.sos.nh.gov/online/BusinessInquire",
++        "method": "nh_scrape",
++    },
++    # Maine
++    "ME": {
++        "search_url": "https://icrs.informe.org/nei-sos-icrs/ICRS",
++        "method": "me_scrape",
++    },
++    # Vermont
++    "VT": {
++        "search_url": "https://bizfilings.vermont.gov/online/BusinessInquire",
++        "method": "vt_scrape",
++    },
++    # Florida - Sunbiz (excellent API)
++    "FL": {
++        "search_url": "https://search.sunbiz.org/Inquiry/CorporationSearch/SearchByName",
++        "api_url": "https://search.sunbiz.org/Inquiry/CorporationSearch/SearchByName",
++        "method": "fl_sunbiz",
++    },
++    # Texas - SOSDirect
++    "TX": {
++        "search_url": "https://mycpa.cpa.state.tx.us/coa/coaSearchBtn",
++        "api_url": "https://mycpa.cpa.state.tx.us/coa/",
++        "method": "tx_sos",
++    },
++}
++
++
++class EntityResolver:
++    """
++    Multi-source entity resolution engine.
++    
++    Priority:
++    1. State-specific SOS lookup (free, authoritative)
++    2. OpenCorporates API ($0.10/lookup, cross-state)
++    3. AI-powered entity parsing (last resort)
++    """
++
++    def __init__(
++        self,
++        opencorporates_key: Optional[str] = None,
++        grok_api_key: Optional[str] = None,
++    ):
++        self.oc_key = opencorporates_key or os.getenv("OPENCORPORATES_API_KEY")
++        self.grok_key = grok_api_key or os.getenv("GROK_API_KEY")
++        self.cost_tracker = 0.0
++
++    async def resolve(
++        self,
++        entity_name: str,
++        state: str,
++        address: Optional[str] = None,
++    ) -> Optional[EntityRecord]:
++        """
++        Resolve an entity name to full corporate record.
++        Tries state SOS first, then OpenCorporates.
++        """
++        if not entity_name or not self._looks_like_entity(entity_name):
++            logger.debug(f"Skipping non-entity name: {entity_name}")
++            return None
++
++        state_upper = state.upper().strip()
++
++        # Try state SOS first (free)
++        record = await self._sos_lookup(entity_name, state_upper)
++        if record:
++            return record
++
++        # Fallback: OpenCorporates
++        if self.oc_key:
++            record = await self._opencorporates_lookup(entity_name, state_upper)
++            if record:
++                self.cost_tracker += 0.10
++                return record
++
++        # Last resort: AI entity parsing
++        if self.grok_key:
++            record = await self._ai_entity_parse(entity_name, state_upper, address)
++            if record:
++                self.cost_tracker += 0.002
++                return record
++
++        logger.warning(f"Entity resolution failed for: {entity_name} ({state_upper})")
++        return None
++
++    # ── State SOS Lookups ─────────────────────────────────────────────
++
++    async def _sos_lookup(
++        self, entity_name: str, state: str
++    ) -> Optional[EntityRecord]:
++        """Route to state-specific SOS lookup."""
++        if state not in SOS_ENDPOINTS:
++            return None
++
++        method = SOS_ENDPOINTS[state]["method"]
++
++        try:
++            if method == "fl_sunbiz":
++                return await self._florida_sunbiz(entity_name)
++            elif method == "concord_api":
++                return await self._ct_concord(entity_name)
++            elif method == "tx_sos":
++                return await self._tx_sos(entity_name)
++            else:
++                # Generic scrape fallback - uses OpenCorporates
++                return None
++        except Exception as e:
++            logger.warning(f"SOS lookup failed for {entity_name} ({state}): {e}")
++            return None
++
++    async def _florida_sunbiz(self, entity_name: str) -> Optional[EntityRecord]:
++        """Florida Sunbiz - well-structured HTML, easy to parse."""
++        clean_name = self._clean_entity_name(entity_name)
++        url = "https://search.sunbiz.org/Inquiry/CorporationSearch/SearchByName"
++
++        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
++            resp = await client.get(url, params={
++                "searchNameOrder": clean_name,
++                "searchTerm": clean_name,
++                "listNameOrder": clean_name,
++            })
++
++            if resp.status_code != 200:
++                return None
++
++            # Parse search results for exact/close match
++            text = resp.text
++            # Look for document number links
++            doc_pattern = r'href="/Inquiry/CorporationSearch/SearchResultDetail\?inquirytype=EntityName&amp;directionType=Initial&amp;searchNameOrder=([^"]+)&amp;aggregateId=([^"]+)"'
++            matches = re.findall(doc_pattern, text)
++
++            if not matches:
++                return None
++
++            # Get first match details
++            _, doc_id = matches[0]
++            detail_url = f"https://search.sunbiz.org/Inquiry/CorporationSearch/SearchResultDetail?inquirytype=EntityName&directionType=Initial&searchNameOrder={clean_name}&aggregateId={doc_id}"
++            
++            detail_resp = await client.get(detail_url)
++            if detail_resp.status_code != 200:
++                return None
++
++            return self._parse_sunbiz_detail(detail_resp.text, entity_name)
++
++    def _parse_sunbiz_detail(self, html: str, entity_name: str) -> Optional[EntityRecord]:
++        """Parse Florida Sunbiz detail page."""
++        record = EntityRecord(
++            entity_name=entity_name,
++            lookup_source="fl_sunbiz",
++            lookup_timestamp=datetime.now(),
++        )
++
++        # Extract filing info
++        filing_match = re.search(r'Document Number[^<]*<[^>]*>([^<]+)', html)
++        if filing_match:
++            record.sos_filing_number = filing_match.group(1).strip()
++
++        # Extract entity type
++        type_match = re.search(r'Filing Type[^<]*<[^>]*>([^<]+)', html)
++        if type_match:
++            raw_type = type_match.group(1).strip()
++            record.entity_type = self._normalize_entity_type(raw_type)
++
++        # Extract status
++        status_match = re.search(r'Status[^<]*<[^>]*>([^<]+)', html)
++        if status_match:
++            record.status = status_match.group(1).strip()
++
++        # Extract registered agent
++        agent_match = re.search(r'Registered Agent Name.*?<span[^>]*>([^<]+)', html, re.DOTALL)
++        if agent_match:
++            record.registered_agent_name = agent_match.group(1).strip()
++
++        # Extract principal address
++        addr_match = re.search(r'Principal Address.*?<div[^>]*>(.*?)</div>', html, re.DOTALL)
++        if addr_match:
++            addr_text = re.sub(r'<[^>]+>', ' ', addr_match.group(1)).strip()
++            record.principal_office_address = ' '.join(addr_text.split())
++
++        # Extract officers/members
++        officer_pattern = r'Title\s*([^<]+).*?<span[^>]*>([^<]+)'
++        officers = re.findall(officer_pattern, html)
++        record.principals = [name.strip() for _, name in officers[:5]]
++
++        record.state_of_formation = "FL"
++        return record
++
++    async def _ct_concord(self, entity_name: str) -> Optional[EntityRecord]:
++        """Connecticut CONCORD system lookup."""
++        clean_name = self._clean_entity_name(entity_name)
++
++        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
++            # CONCORD uses a Salesforce-backed API
++            resp = await client.get(
++                "https://service.ct.gov/business/s/onlinebusinesssearch",
++                params={"term": clean_name},
++            )
++
++            if resp.status_code != 200:
++                return None
++
++            # Parse results - CONCORD returns HTML
++            # Look for business ID links
++            id_pattern = r'/business/s/onlinebusinesssearch\?Id=([^"&]+)'
++            matches = re.findall(id_pattern, resp.text)
++
++            if not matches:
++                return None
++
++            record = EntityRecord(
++                entity_name=entity_name,
++                state_of_formation="CT",
++                lookup_source="ct_concord",
++                lookup_timestamp=datetime.now(),
++            )
++
++            return record
++
++    async def _tx_sos(self, entity_name: str) -> Optional[EntityRecord]:
++        """Texas SOS Direct lookup."""
++        clean_name = self._clean_entity_name(entity_name)
++
++        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
++            resp = await client.post(
++                "https://mycpa.cpa.state.tx.us/coa/coaSearchBtn",
++                data={
++                    "searchTerm": clean_name,
++                    "searchType": "entityName",
++                },
++            )
++
++            if resp.status_code != 200:
++                return None
++
++            record = EntityRecord(
++                entity_name=entity_name,
++                state_of_formation="TX",
++                lookup_source="tx_sos",
++                lookup_timestamp=datetime.now(),
++            )
++
++            # Parse basic info from results
++            type_match = re.search(r'Filing Type.*?<td[^>]*>([^<]+)', resp.text, re.DOTALL)
++            if type_match:
++                record.entity_type = self._normalize_entity_type(type_match.group(1).strip())
++
++            status_match = re.search(r'Status.*?<td[^>]*>([^<]+)', resp.text, re.DOTALL)
++            if status_match:
++                record.status = status_match.group(1).strip()
++
++            return record
++
++    # ── OpenCorporates ────────────────────────────────────────────────
++
++    async def _opencorporates_lookup(
++        self, entity_name: str, state: str
++    ) -> Optional[EntityRecord]:
++        """OpenCorporates API - paid, cross-state coverage."""
++        clean_name = self._clean_entity_name(entity_name)
++        state_code = f"us_{state.lower()}"
++
++        async with httpx.AsyncClient(timeout=30) as client:
++            resp = await client.get(
++                "https://api.opencorporates.com/v0.4/companies/search",
++                params={
++                    "q": clean_name,
++                    "jurisdiction_code": state_code,
++                    "api_token": self.oc_key,
++                },
++            )
++
++            if resp.status_code != 200:
++                return None
++
++            data = resp.json()
++            companies = data.get("results", {}).get("companies", [])
++            if not companies:
++                return None
++
++            company = companies[0].get("company", {})
++
++            record = EntityRecord(
++                entity_name=company.get("name", entity_name),
++                entity_type=self._normalize_entity_type(company.get("company_type", "")),
++                state_of_formation=state,
++                status=company.get("current_status", ""),
++                registered_agent_name=company.get("agent_name", ""),
++                registered_agent_address=company.get("agent_address", ""),
++                sos_filing_number=company.get("company_number", ""),
++                sos_url=company.get("opencorporates_url", ""),
++                lookup_source="opencorporates",
++                lookup_timestamp=datetime.now(),
++            )
++
++            # Get officers
++            officers = company.get("officers", [])
++            record.principals = [
++                o.get("officer", {}).get("name", "")
++                for o in officers[:5]
++                if o.get("officer", {}).get("name")
++            ]
++
++            return record
++
++    # ── AI Entity Parsing ─────────────────────────────────────────────
++
++    async def _ai_entity_parse(
++        self, entity_name: str, state: str, address: Optional[str]
++    ) -> Optional[EntityRecord]:
++        """Use Grok to infer entity type and likely principals from name patterns."""
++        from openai import AsyncOpenAI
++
++        client = AsyncOpenAI(api_key=self.grok_key, base_url="https://api.x.ai/v1")
++
++        prompt = f"""Analyze this entity name from a building permit and infer what you can.
++Entity: {entity_name}
++State: {state}
++Address: {address or "N/A"}
++
++Return ONLY JSON:
++{{
++  "entity_type": "LLC|Corp|LP|Trust|Individual|Unknown",
++  "likely_individual_name": "<best guess at human name behind entity, or null>",
++  "is_likely_investor": true/false,
++  "confidence": 0.0-1.0
++}}"""
++
++        try:
++            response = await client.chat.completions.create(
++                model="grok-3-mini",
++                messages=[{"role": "user", "content": prompt}],
++                max_tokens=200,
++                temperature=0.1,
++            )
++            text = response.choices[0].message.content.strip()
++            text = text.replace("```json", "").replace("```", "").strip()
++            result = json.loads(text)
++
++            record = EntityRecord(
++                entity_name=entity_name,
++                entity_type=result.get("entity_type", "Unknown"),
++                state_of_formation=state,
++                lookup_source="ai_inference",
++                lookup_timestamp=datetime.now(),
++            )
++
++            if result.get("likely_individual_name"):
++                record.principals = [result["likely_individual_name"]]
++
++            return record
++
++        except Exception as e:
++            logger.warning(f"AI entity parse failed: {e}")
++            return None
++
++    # ── Helpers ────────────────────────────────────────────────────────
++
++    @staticmethod
++    def _looks_like_entity(name: str) -> bool:
++        """Check if a name looks like a business entity vs individual."""
++        entity_indicators = [
++            "llc", "l.l.c.", "inc", "corp", "ltd", "lp", "l.p.",
++            "trust", "associates", "partners", "properties",
++            "holdings", "group", "ventures", "capital", "management",
++            "development", "construction", "builders", "realty",
++            "real estate", "investments", "enterprises", "company",
++        ]
++        lower = name.lower()
++        return any(ind in lower for ind in entity_indicators)
++
++    @staticmethod
++    def _clean_entity_name(name: str) -> str:
++        """Clean entity name for search queries."""
++        # Remove common suffixes that confuse search
++        suffixes = [", LLC", " LLC", ", Inc.", " Inc.", ", Corp.", " Corp.",
++                     ", Ltd.", " Ltd.", ", L.P.", " L.P.", ", LP", " LP"]
++        clean = name
++        for suffix in suffixes:
++            if clean.upper().endswith(suffix.upper()):
++                clean = clean[:-len(suffix)]
++        return clean.strip()
++
++    @staticmethod
++    def _normalize_entity_type(raw: str) -> str:
++        """Normalize entity type strings."""
++        lower = raw.lower()
++        if "llc" in lower or "limited liability" in lower:
++            return "LLC"
++        elif "corp" in lower or "incorporated" in lower:
++            return "Corp"
++        elif "limited partnership" in lower or lower.strip() == "lp":
++            return "LP"
++        elif "trust" in lower:
++            return "Trust"
++        else:
++            return raw.strip()[:20] if raw else "Unknown"
+diff --git a/enrichment/news_intel/__init__.py b/enrichment/news_intel/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/enrichment/news_intel/search.py b/enrichment/news_intel/search.py
+new file mode 100644
+index 0000000..84f93ad
+--- /dev/null
++++ b/enrichment/news_intel/search.py
+@@ -0,0 +1,257 @@
++"""
++Layer 4: News & Public Record Intelligence
++Searches for project/entity in news, court records, and municipal records.
++"""
++import os
++import json
++from datetime import datetime
++from typing import Optional
++
++import httpx
++from loguru import logger
++
++from openshovels.schema import NewsIntelligence, NewsHit
++
++
++class NewsIntel:
++    """
++    Multi-source news and public record search.
++    Surfaces deal context: zoning issues, community opposition,
++    tax incentives, litigation, press coverage.
++    """
++
++    def __init__(
++        self,
++        google_news_api_key: Optional[str] = None,
++        grok_api_key: Optional[str] = None,
++    ):
++        self.google_key = google_news_api_key or os.getenv("GOOGLE_NEWS_API_KEY")
++        self.grok_key = grok_api_key or os.getenv("GROK_API_KEY")
++        self.cost_tracker = 0.0
++
++    async def search(
++        self,
++        entity_name: Optional[str] = None,
++        address: Optional[str] = None,
++        city: Optional[str] = None,
++        state: Optional[str] = None,
++    ) -> NewsIntelligence:
++        """
++        Search news and public records for project/entity context.
++        """
++        queries = self._build_queries(entity_name, address, city, state)
++        all_articles: list[NewsHit] = []
++
++        for query in queries:
++            articles = await self._google_news_search(query)
++            all_articles.extend(articles)
++
++        # Deduplicate by URL
++        seen_urls = set()
++        unique_articles = []
++        for article in all_articles:
++            if article.url and article.url not in seen_urls:
++                seen_urls.add(article.url)
++                unique_articles.append(article)
++            elif not article.url:
++                unique_articles.append(article)
++
++        # Build intelligence report
++        intel = NewsIntelligence(
++            search_query=" | ".join(queries),
++            total_hits=len(unique_articles),
++            articles=unique_articles[:20],  # Cap at 20
++            search_timestamp=datetime.now(),
++        )
++
++        # Analyze for risk signals
++        if unique_articles and self.grok_key:
++            intel = await self._ai_analyze(intel)
++
++        # Keyword-based flag detection (fast fallback)
++        intel = self._detect_flags(intel)
++
++        return intel
++
++    async def _google_news_search(self, query: str) -> list[NewsHit]:
++        """Search Google News via Custom Search API."""
++        if not self.google_key:
++            return await self._fallback_news_search(query)
++
++        try:
++            async with httpx.AsyncClient(timeout=20) as client:
++                # Google Custom Search JSON API
++                resp = await client.get(
++                    "https://www.googleapis.com/customsearch/v1",
++                    params={
++                        "key": self.google_key,
++                        "cx": os.getenv("GOOGLE_CSE_ID", ""),
++                        "q": query,
++                        "num": 10,
++                        "sort": "date",
++                        "tbm": "nws",  # News search
++                    },
++                )
++
++                self.cost_tracker += 0.005  # ~$5/1000 queries
++
++                if resp.status_code != 200:
++                    logger.debug(f"Google News API error: {resp.status_code}")
++                    return []
++
++                data = resp.json()
++                items = data.get("items", [])
++
++                return [
++                    NewsHit(
++                        title=item.get("title", ""),
++                        source=item.get("displayLink", ""),
++                        url=item.get("link", ""),
++                        snippet=item.get("snippet", ""),
++                    )
++                    for item in items
++                ]
++
++        except Exception as e:
++            logger.warning(f"Google News search failed: {e}")
++            return []
++
++    async def _fallback_news_search(self, query: str) -> list[NewsHit]:
++        """Fallback: use Google search without API key."""
++        try:
++            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
++                resp = await client.get(
++                    "https://news.google.com/rss/search",
++                    params={"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"},
++                )
++
++                if resp.status_code != 200:
++                    return []
++
++                # Parse RSS XML
++                import xml.etree.ElementTree as ET
++                root = ET.fromstring(resp.text)
++
++                articles = []
++                for item in root.findall(".//item")[:10]:
++                    title = item.findtext("title", "")
++                    link = item.findtext("link", "")
++                    source = item.findtext("source", "")
++                    pub_date = item.findtext("pubDate", "")
++                    desc = item.findtext("description", "")
++
++                    articles.append(NewsHit(
++                        title=title,
++                        source=source,
++                        url=link,
++                        snippet=desc[:300] if desc else "",
++                    ))
++
++                return articles
++
++        except Exception as e:
++            logger.debug(f"RSS news search failed: {e}")
++            return []
++
++    async def _ai_analyze(self, intel: NewsIntelligence) -> NewsIntelligence:
++        """Use Grok to analyze news articles for risk signals."""
++        from openai import AsyncOpenAI
++
++        client = AsyncOpenAI(api_key=self.grok_key, base_url="https://api.x.ai/v1")
++
++        articles_text = "\n".join([
++            f"- {a.title} ({a.source}): {a.snippet or ''}"
++            for a in intel.articles[:10]
++        ])
++
++        prompt = f"""Analyze these news articles about a real estate development project.
++Identify any risk signals for a construction lender.
++
++Articles:
++{articles_text}
++
++Return ONLY JSON:
++{{
++  "has_zoning_issues": true/false,
++  "has_community_opposition": true/false,
++  "has_tax_incentives": true/false,
++  "has_litigation": true/false,
++  "summary": "<2-3 sentence summary of key findings for a construction lender>",
++  "sentiment_overall": "positive|negative|neutral|mixed"
++}}"""
++
++        try:
++            response = await client.chat.completions.create(
++                model="grok-3-mini",
++                messages=[{"role": "user", "content": prompt}],
++                max_tokens=300,
++                temperature=0.1,
++            )
++
++            self.cost_tracker += 0.002
++
++            text = response.choices[0].message.content.strip()
++            text = text.replace("```json", "").replace("```", "").strip()
++            result = json.loads(text)
++
++            intel.has_zoning_issues = result.get("has_zoning_issues", False)
++            intel.has_community_opposition = result.get("has_community_opposition", False)
++            intel.has_tax_incentives = result.get("has_tax_incentives", False)
++            intel.has_litigation = result.get("has_litigation", False)
++            intel.ai_summary = result.get("summary", "")
++
++        except Exception as e:
++            logger.warning(f"AI news analysis failed: {e}")
++
++        return intel
++
++    def _detect_flags(self, intel: NewsIntelligence) -> NewsIntelligence:
++        """Keyword-based flag detection from article titles/snippets."""
++        all_text = " ".join([
++            f"{a.title} {a.snippet or ''}" for a in intel.articles
++        ]).lower()
++
++        if not intel.has_zoning_issues:
++            zoning_keywords = ["zoning", "variance", "zone change", "planning board",
++                              "conditional use", "special permit", "overlay"]
++            intel.has_zoning_issues = any(kw in all_text for kw in zoning_keywords)
++
++        if not intel.has_community_opposition:
++            opposition_keywords = ["opposition", "protest", "neighbors object",
++                                  "community pushback", "residents oppose", "stop"]
++            intel.has_community_opposition = any(kw in all_text for kw in opposition_keywords)
++
++        if not intel.has_tax_incentives:
++            incentive_keywords = ["tax break", "tax incentive", "tif", "tax increment",
++                                 "abatement", "opportunity zone", "enterprise zone"]
++            intel.has_tax_incentives = any(kw in all_text for kw in incentive_keywords)
++
++        if not intel.has_litigation:
++            lit_keywords = ["lawsuit", "sued", "litigation", "court", "injunction",
++                           "lien", "foreclosure", "bankruptcy"]
++            intel.has_litigation = any(kw in all_text for kw in lit_keywords)
++
++        return intel
++
++    def _build_queries(
++        self,
++        entity_name: Optional[str],
++        address: Optional[str],
++        city: Optional[str],
++        state: Optional[str],
++    ) -> list[str]:
++        """Build search queries from available data."""
++        queries = []
++        location = f"{city} {state}" if city and state else ""
++
++        if entity_name and location:
++            queries.append(f'"{entity_name}" {location} construction development')
++
++        if address and location:
++            queries.append(f'"{address}" {location} building permit development')
++
++        if entity_name:
++            queries.append(f'"{entity_name}" real estate development')
++
++        # Limit to 3 queries
++        return queries[:3]
+diff --git a/enrichment/orchestrator.py b/enrichment/orchestrator.py
+new file mode 100644
+index 0000000..00f30b4
+--- /dev/null
++++ b/enrichment/orchestrator.py
+@@ -0,0 +1,251 @@
++"""
++TILT Enrichment Orchestrator
++Runs all 5 enrichment layers on qualified permits:
++  1. Entity Resolution (SOS lookup)
++  2. Skip Trace (contact discovery)
++  3. Property Intelligence (ATTOM)
++  4. News Intel (Google News + court records)
++  5. Contractor Reverse Lookup
++
++Each layer is independent and fail-safe.
++Cost tracking built in for per-lead economics.
++"""
++import asyncio
++from datetime import datetime
++from typing import Optional
++
++from loguru import logger
++
++from openshovels.schema import StandardPermit, EnrichmentBundle
++from enrichment.entity_resolution.resolver import EntityResolver
++from enrichment.skip_trace.tracer import SkipTracer
++from enrichment.property_data.attom import PropertyIntel
++from enrichment.news_intel.search import NewsIntel
++from enrichment.contractor_intel.reverse_lookup import ContractorIntel
++
++
++class EnrichmentOrchestrator:
++    """
++    Master orchestrator for the 5-layer enrichment pipeline.
++    
++    Usage:
++        orch = EnrichmentOrchestrator()
++        enriched_permits = await orch.enrich_batch(qualified_permits)
++    """
++
++    def __init__(self):
++        self.entity_resolver = EntityResolver()
++        self.skip_tracer = SkipTracer()
++        self.property_intel = PropertyIntel()
++        self.news_intel = NewsIntel()
++        self.contractor_intel = ContractorIntel()
++        self.total_cost = 0.0
++
++    async def enrich_permit(
++        self,
++        permit: StandardPermit,
++        layers: Optional[list[str]] = None,
++    ) -> StandardPermit:
++        """
++        Run enrichment layers on a single permit.
++        
++        Args:
++            permit: Qualified StandardPermit
++            layers: Optional list of layers to run. Default: all.
++                    Options: "entity", "skip_trace", "property", "news", "contractor"
++        """
++        if layers is None:
++            layers = ["entity", "skip_trace", "property", "news", "contractor"]
++
++        bundle = EnrichmentBundle(
++            permit_id=permit.permit_id,
++            enrichment_timestamp=datetime.now(),
++        )
++
++        entity_name = permit.owner_entity or permit.owner_name
++        cost = 0.0
++
++        # ── Layer 1: Entity Resolution ────────────────────────────────
++        if "entity" in layers and entity_name:
++            try:
++                entity = await self.entity_resolver.resolve(
++                    entity_name=entity_name,
++                    state=permit.state,
++                    address=permit.address,
++                )
++                if entity:
++                    bundle.entity = entity
++                    bundle.enrichment_layers_completed.append("entity")
++                    logger.info(
++                        f"[{permit.permit_id}] Entity resolved: {entity.entity_name} "
++                        f"→ {entity.entity_type} | Agent: {entity.registered_agent_name}"
++                    )
++            except Exception as e:
++                logger.warning(f"[{permit.permit_id}] Entity resolution failed: {e}")
++
++        # ── Layer 2: Skip Trace ───────────────────────────────────────
++        if "skip_trace" in layers:
++            # Determine best person to skip trace
++            trace_name = None
++            if bundle.entity and bundle.entity.registered_agent_name:
++                trace_name = bundle.entity.registered_agent_name
++            elif bundle.entity and bundle.entity.principals:
++                trace_name = bundle.entity.principals[0]
++            elif entity_name and not self.entity_resolver._looks_like_entity(entity_name):
++                trace_name = entity_name
++
++            if trace_name:
++                try:
++                    skip_result = await self.skip_tracer.trace(
++                        person_name=trace_name,
++                        address=permit.address,
++                        city=permit.city,
++                        state=permit.state,
++                        zip_code=permit.zip_code,
++                    )
++                    if skip_result:
++                        # DNC check on all phones
++                        skip_result = await self.skip_tracer.validate_phones(skip_result)
++                        bundle.skip_trace = skip_result
++                        bundle.enrichment_layers_completed.append("skip_trace")
++                        phone_count = len(skip_result.phones)
++                        email_count = len(skip_result.emails)
++                        logger.info(
++                            f"[{permit.permit_id}] Skip trace: {trace_name} "
++                            f"→ {phone_count} phones, {email_count} emails"
++                        )
++                except Exception as e:
++                    logger.warning(f"[{permit.permit_id}] Skip trace failed: {e}")
++
++        # ── Layer 3: Property Intelligence ────────────────────────────
++        if "property" in layers and permit.address:
++            try:
++                prop = await self.property_intel.lookup(
++                    address=permit.address,
++                    city=permit.city,
++                    state=permit.state,
++                    zip_code=permit.zip_code,
++                )
++                if prop:
++                    bundle.property_intel = prop
++                    bundle.enrichment_layers_completed.append("property")
++                    logger.info(
++                        f"[{permit.permit_id}] Property intel: "
++                        f"Market: ${float(prop.market_value or 0):,.0f} | "
++                        f"Mortgage: ${float(prop.mortgage_amount or 0):,.0f} | "
++                        f"NOO: {prop.owner_mailing_address is not None}"
++                    )
++            except Exception as e:
++                logger.warning(f"[{permit.permit_id}] Property intel failed: {e}")
++
++        # ── Layer 4: News Intel ───────────────────────────────────────
++        if "news" in layers:
++            try:
++                news = await self.news_intel.search(
++                    entity_name=entity_name,
++                    address=permit.address,
++                    city=permit.city,
++                    state=permit.state,
++                )
++                if news and news.total_hits > 0:
++                    bundle.news_intel = news
++                    bundle.enrichment_layers_completed.append("news")
++                    flags = []
++                    if news.has_zoning_issues: flags.append("ZONING")
++                    if news.has_community_opposition: flags.append("OPPOSITION")
++                    if news.has_tax_incentives: flags.append("INCENTIVES")
++                    if news.has_litigation: flags.append("LITIGATION")
++                    logger.info(
++                        f"[{permit.permit_id}] News: {news.total_hits} hits | "
++                        f"Flags: {', '.join(flags) if flags else 'none'}"
++                    )
++            except Exception as e:
++                logger.warning(f"[{permit.permit_id}] News intel failed: {e}")
++
++        # ── Layer 5: Contractor Lookup ────────────────────────────────
++        if "contractor" in layers and permit.contractor_name:
++            try:
++                contractor = self.contractor_intel.lookup(permit.contractor_name)
++                if contractor:
++                    bundle.contractor = contractor
++                    bundle.enrichment_layers_completed.append("contractor")
++                    logger.info(
++                        f"[{permit.permit_id}] Contractor: {contractor.contractor_name} "
++                        f"→ {contractor.active_permits_count} permits | "
++                        f"Referral: {contractor.referral_potential}"
++                    )
++            except Exception as e:
++                logger.warning(f"[{permit.permit_id}] Contractor lookup failed: {e}")
++
++        # ── Cost Tracking ─────────────────────────────────────────────
++        cost = (
++            self.entity_resolver.cost_tracker
++            + self.skip_tracer.cost_tracker
++            + self.property_intel.cost_tracker
++            + self.news_intel.cost_tracker
++        )
++        bundle.enrichment_cost_usd = round(cost, 4)
++        self.total_cost += cost
++
++        permit.enrichment = bundle
++        return permit
++
++    async def enrich_batch(
++        self,
++        permits: list[StandardPermit],
++        concurrency: int = 3,
++        layers: Optional[list[str]] = None,
++    ) -> list[StandardPermit]:
++        """
++        Enrich a batch of permits with rate limiting.
++        
++        Args:
++            permits: List of qualified StandardPermits
++            concurrency: Max concurrent enrichment tasks
++            layers: Optional subset of layers to run
++        """
++        # First, index all permits for contractor reverse lookup
++        self.contractor_intel.index_permits(permits)
++
++        semaphore = asyncio.Semaphore(concurrency)
++
++        async def _enrich_limited(p):
++            async with semaphore:
++                return await self.enrich_permit(p, layers=layers)
++
++        tasks = [_enrich_limited(p) for p in permits]
++        results = await asyncio.gather(*tasks, return_exceptions=True)
++
++        enriched = []
++        errors = 0
++        for result in results:
++            if isinstance(result, StandardPermit):
++                enriched.append(result)
++            elif isinstance(result, Exception):
++                errors += 1
++                logger.error(f"Enrichment error: {result}")
++
++        # Stats
++        with_contact = sum(
++            1 for p in enriched
++            if p.enrichment and p.enrichment.has_contact_info
++        )
++
++        logger.info(
++            f"Enrichment complete: {len(enriched)}/{len(permits)} permits | "
++            f"{with_contact} with contact info | "
++            f"{errors} errors | "
++            f"Total cost: ${self.total_cost:.2f}"
++        )
++
++        return enriched
++
++    def get_stats(self) -> dict:
++        """Get enrichment run statistics."""
++        return {
++            "total_cost": round(self.total_cost, 4),
++            "entity_cost": round(self.entity_resolver.cost_tracker, 4),
++            "skip_trace_cost": round(self.skip_tracer.cost_tracker, 4),
++            "property_cost": round(self.property_intel.cost_tracker, 4),
++            "news_cost": round(self.news_intel.cost_tracker, 4),
++        }
+diff --git a/enrichment/property_data/__init__.py b/enrichment/property_data/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/enrichment/property_data/attom.py b/enrichment/property_data/attom.py
+new file mode 100644
+index 0000000..07087a6
+--- /dev/null
++++ b/enrichment/property_data/attom.py
+@@ -0,0 +1,244 @@
++"""
++Layer 3: Property Intelligence
++ATTOM Data API for property ownership, mortgage, equity, and market data.
++County assessor fallback for tax records and mailing addresses.
++"""
++import os
++from datetime import datetime
++from decimal import Decimal
++from typing import Optional
++
++import httpx
++from loguru import logger
++
++from openshovels.schema import PropertyIntelligence
++
++
++class PropertyIntel:
++    """
++    Property data enrichment via ATTOM Data Solutions API.
++    Provides ownership, mortgage, valuation, and market data.
++    
++    ATTOM API: https://api.gateway.attomdata.com/
++    Pricing: ~$0.05/record (property detail), ~$0.10/record (with AVM)
++    """
++
++    ATTOM_BASE = "https://api.gateway.attomdata.com/propertyapi/v1.0.0"
++
++    def __init__(self, attom_api_key: Optional[str] = None):
++        self.api_key = attom_api_key or os.getenv("ATTOM_API_KEY")
++        self.cost_tracker = 0.0
++
++    async def lookup(
++        self,
++        address: str,
++        city: str,
++        state: str,
++        zip_code: Optional[str] = None,
++    ) -> Optional[PropertyIntelligence]:
++        """
++        Full property lookup: ownership, mortgage, valuation, tax.
++        """
++        if not self.api_key:
++            logger.debug("ATTOM_API_KEY not set — skipping property lookup")
++            return None
++
++        try:
++            # Step 1: Get property ID from address
++            prop_data = await self._property_detail(address, city, state)
++            if not prop_data:
++                return None
++
++            # Step 2: Get AVM (Automated Valuation Model)
++            avm_data = await self._property_avm(address, city, state)
++
++            # Step 3: Get sales history
++            sales_data = await self._sales_history(address, city, state)
++
++            return self._build_intel(prop_data, avm_data, sales_data, address)
++
++        except Exception as e:
++            logger.warning(f"Property intel lookup failed for {address}: {e}")
++            return None
++
++    async def _property_detail(
++        self, address: str, city: str, state: str
++    ) -> Optional[dict]:
++        """ATTOM Property Detail API."""
++        async with httpx.AsyncClient(timeout=30) as client:
++            resp = await client.get(
++                f"{self.ATTOM_BASE}/property/detail",
++                params={
++                    "address1": address,
++                    "address2": f"{city}, {state}",
++                },
++                headers={
++                    "apikey": self.api_key,
++                    "Accept": "application/json",
++                },
++            )
++
++            self.cost_tracker += 0.05
++
++            if resp.status_code != 200:
++                logger.debug(f"ATTOM detail {resp.status_code}: {resp.text[:200]}")
++                return None
++
++            data = resp.json()
++            properties = data.get("property", [])
++            return properties[0] if properties else None
++
++    async def _property_avm(
++        self, address: str, city: str, state: str
++    ) -> Optional[dict]:
++        """ATTOM AVM (Automated Valuation Model)."""
++        async with httpx.AsyncClient(timeout=30) as client:
++            resp = await client.get(
++                f"{self.ATTOM_BASE}/valuation/homeequity",
++                params={
++                    "address1": address,
++                    "address2": f"{city}, {state}",
++                },
++                headers={
++                    "apikey": self.api_key,
++                    "Accept": "application/json",
++                },
++            )
++
++            self.cost_tracker += 0.05
++
++            if resp.status_code != 200:
++                return None
++
++            data = resp.json()
++            properties = data.get("property", [])
++            return properties[0] if properties else None
++
++    async def _sales_history(
++        self, address: str, city: str, state: str
++    ) -> Optional[dict]:
++        """ATTOM Sales History."""
++        async with httpx.AsyncClient(timeout=30) as client:
++            resp = await client.get(
++                f"{self.ATTOM_BASE}/sale/detail",
++                params={
++                    "address1": address,
++                    "address2": f"{city}, {state}",
++                },
++                headers={
++                    "apikey": self.api_key,
++                    "Accept": "application/json",
++                },
++            )
++
++            self.cost_tracker += 0.03
++
++            if resp.status_code != 200:
++                return None
++
++            data = resp.json()
++            properties = data.get("property", [])
++            return properties[0] if properties else None
++
++    def _build_intel(
++        self,
++        prop: dict,
++        avm: Optional[dict],
++        sales: Optional[dict],
++        address: str,
++    ) -> PropertyIntelligence:
++        """Build PropertyIntelligence from ATTOM responses."""
++        # Owner info
++        owner_info = prop.get("owner", {}) or {}
++        owner1 = owner_info.get("owner1", {}) or {}
++
++        # Assessment
++        assessment = prop.get("assessment", {}) or {}
++        assessed = assessment.get("assessed", {}) or {}
++        market = assessment.get("market", {}) or {}
++        tax = assessment.get("tax", {}) or {}
++
++        # Building
++        building = prop.get("building", {}) or {}
++        size = building.get("size", {}) or {}
++        summary = building.get("summary", {}) or {}
++
++        # Lot
++        lot = prop.get("lot", {}) or {}
++
++        # Mortgage
++        mortgage = prop.get("mortgage", {}) or {}
++        first_mortgage = mortgage.get("firstConcurrent", {}) or {}
++
++        # AVM data
++        avm_data = {}
++        if avm:
++            avm_data = avm.get("avm", {}) or {}
++
++        # Sales data
++        last_sale = {}
++        if sales:
++            sale_history = sales.get("saleHistory", []) or []
++            if sale_history:
++                last_sale = sale_history[0] if isinstance(sale_history, list) else {}
++
++        # Mailing address (key NOO indicator)
++        mail_addr = owner_info.get("mailingAddressOneLine", "")
++
++        intel = PropertyIntelligence(
++            property_address=address,
++            owner_name=owner1.get("fullName", ""),
++            owner_mailing_address=mail_addr if mail_addr else None,
++            assessed_value=self._to_decimal(assessed.get("assdTtlValue")),
++            market_value=self._to_decimal(market.get("mktTtlValue")),
++            last_sale_date=self._parse_date(last_sale.get("saleTransDate")),
++            last_sale_price=self._to_decimal(last_sale.get("saleAmt")),
++            mortgage_amount=self._to_decimal(first_mortgage.get("amount")),
++            mortgage_lender=first_mortgage.get("lenderName", ""),
++            equity_estimate=self._to_decimal(avm_data.get("equity")),
++            year_built=self._to_int(summary.get("yearBuilt")),
++            lot_size_sqft=self._to_int(lot.get("lotSize1")),
++            building_sqft=self._to_int(size.get("livingSize")),
++            zoning=lot.get("zoningType", ""),
++            tax_amount=self._to_decimal(tax.get("taxAmt")),
++            rental_estimate=self._to_decimal(avm_data.get("rentalAvm")),
++            arv_estimate=self._to_decimal(avm_data.get("amount", {}).get("value") if isinstance(avm_data.get("amount"), dict) else avm_data.get("amount")),
++            data_source="attom",
++            lookup_timestamp=datetime.now(),
++        )
++
++        return intel
++
++    @staticmethod
++    def _to_decimal(value) -> Optional[Decimal]:
++        if value is None:
++            return None
++        try:
++            return Decimal(str(value))
++        except Exception:
++            return None
++
++    @staticmethod
++    def _to_int(value) -> Optional[int]:
++        if value is None:
++            return None
++        try:
++            return int(value)
++        except Exception:
++            return None
++
++    @staticmethod
++    def _parse_date(value) -> Optional[str]:
++        if not value:
++            return None
++        try:
++            from datetime import date as d
++            # ATTOM dates are typically YYYY-MM-DD or MM/DD/YYYY
++            for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
++                try:
++                    return d.fromisoformat(value) if "-" in str(value) else None
++                except Exception:
++                    continue
++            return None
++        except Exception:
++            return None
+diff --git a/enrichment/skip_trace/__init__.py b/enrichment/skip_trace/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/enrichment/skip_trace/tracer.py b/enrichment/skip_trace/tracer.py
+new file mode 100644
+index 0000000..ca301b9
+--- /dev/null
++++ b/enrichment/skip_trace/tracer.py
+@@ -0,0 +1,442 @@
++"""
++Layer 2: Skip Trace — Contact Discovery Pipeline
++Multi-source skip tracing to find phone, email, mailing address for entity principals.
++
++Sources (in priority order):
++1. Free public record sites (FastPeopleSearch, TruePeopleSearch)
++2. BatchSkipTracing API ($0.12-0.18/record)
++3. PropStream API ($99/mo unlimited)
++4. REISkip API ($0.10-0.15/record)
++5. County tax records (mailing address)
++
++TCPA Compliance: All phones checked against DNC registry before outreach.
++"""
++import os
++import re
++import json
++from datetime import datetime
++from typing import Optional
++
++import httpx
++from loguru import logger
++
++from openshovels.schema import SkipTraceResult
++
++
++class SkipTracer:
++    """
++    Multi-source skip trace engine.
++    Finds contact info for entity principals from building permits.
++    """
++
++    def __init__(
++        self,
++        batch_skip_api_key: Optional[str] = None,
++        propstream_api_key: Optional[str] = None,
++        reiskip_api_key: Optional[str] = None,
++        grok_api_key: Optional[str] = None,
++    ):
++        self.batch_skip_key = batch_skip_api_key or os.getenv("BATCH_SKIP_API_KEY")
++        self.propstream_key = propstream_api_key or os.getenv("PROPSTREAM_API_KEY")
++        self.reiskip_key = reiskip_api_key or os.getenv("REISKIP_API_KEY")
++        self.grok_key = grok_api_key or os.getenv("GROK_API_KEY")
++        self.cost_tracker = 0.0
++
++    async def trace(
++        self,
++        person_name: str,
++        address: Optional[str] = None,
++        city: Optional[str] = None,
++        state: Optional[str] = None,
++        zip_code: Optional[str] = None,
++    ) -> Optional[SkipTraceResult]:
++        """
++        Run skip trace through available sources.
++        Returns first successful result with contact info.
++        """
++        if not person_name:
++            return None
++
++        # Parse name
++        first, last = self._parse_name(person_name)
++        if not last:
++            logger.debug(f"Cannot parse name for skip trace: {person_name}")
++            return None
++
++        # Try sources in priority order
++        result = None
++
++        # Source 1: Free public records (FastPeopleSearch-style)
++        result = await self._free_lookup(first, last, city, state)
++        if result and result.phones:
++            logger.info(f"Skip trace hit (free): {person_name} -> {len(result.phones)} phones")
++            return result
++
++        # Source 2: BatchSkipTracing API
++        if self.batch_skip_key:
++            result = await self._batch_skip_trace(first, last, address, city, state, zip_code)
++            if result and result.phones:
++                self.cost_tracker += 0.15
++                logger.info(f"Skip trace hit (BatchSkip): {person_name} -> {len(result.phones)} phones")
++                return result
++
++        # Source 3: PropStream
++        if self.propstream_key and address:
++            result = await self._propstream_lookup(address, city, state, zip_code)
++            if result and result.phones:
++                logger.info(f"Skip trace hit (PropStream): {person_name} -> {len(result.phones)} phones")
++                return result
++
++        # Source 4: REISkip
++        if self.reiskip_key:
++            result = await self._reiskip_lookup(first, last, address, city, state)
++            if result and result.phones:
++                self.cost_tracker += 0.12
++                logger.info(f"Skip trace hit (REISkip): {person_name} -> {len(result.phones)} phones")
++                return result
++
++        # Return whatever we have, even without phone
++        if result:
++            return result
++
++        # Minimal result with just the name parsed
++        return SkipTraceResult(
++            person_name=person_name,
++            first_name=first,
++            last_name=last,
++            skip_trace_source="no_hit",
++            skip_trace_timestamp=datetime.now(),
++        )
++
++    # ── Source 1: Free Public Records ─────────────────────────────────
++
++    async def _free_lookup(
++        self,
++        first: str,
++        last: str,
++        city: Optional[str],
++        state: Optional[str],
++    ) -> Optional[SkipTraceResult]:
++        """
++        Free people search using public record aggregators.
++        Uses ThatsThem, Whitepages-style lookups.
++        """
++        try:
++            # Try ThatsThem API (free tier)
++            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
++                search_url = f"https://thatsthem.com/name/{first}-{last}"
++                if city and state:
++                    search_url += f"/{city}-{state}"
++
++                resp = await client.get(search_url, headers={
++                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
++                })
++
++                if resp.status_code != 200:
++                    return None
++
++                return self._parse_free_results(resp.text, first, last)
++
++        except Exception as e:
++            logger.debug(f"Free lookup failed for {first} {last}: {e}")
++            return None
++
++    def _parse_free_results(
++        self, html: str, first: str, last: str
++    ) -> Optional[SkipTraceResult]:
++        """Parse phone/email from free people search results."""
++        result = SkipTraceResult(
++            person_name=f"{first} {last}",
++            first_name=first,
++            last_name=last,
++            skip_trace_source="free_lookup",
++            skip_trace_timestamp=datetime.now(),
++        )
++
++        # Extract phone numbers (pattern: xxx-xxx-xxxx or (xxx) xxx-xxxx)
++        phone_pattern = r'[\(]?\d{3}[\)]?[-.\s]?\d{3}[-.\s]?\d{4}'
++        phones = re.findall(phone_pattern, html)
++        seen = set()
++        for phone in phones:
++            clean = re.sub(r'[^\d]', '', phone)
++            if len(clean) == 10 and clean not in seen:
++                seen.add(clean)
++                result.phones.append({
++                    "number": f"({clean[:3]}) {clean[3:6]}-{clean[6:]}",
++                    "type": "Unknown",
++                    "dnc_status": "unchecked",
++                })
++            if len(result.phones) >= 3:
++                break
++
++        # Extract emails
++        email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
++        emails = re.findall(email_pattern, html)
++        result.emails = list(set(emails))[:3]
++
++        # Extract address
++        addr_pattern = r'(\d+\s+[\w\s]+(?:St|Ave|Rd|Dr|Blvd|Ln|Way|Ct|Pl|Cir)[\w\s,]*\d{5})'
++        addresses = re.findall(addr_pattern, html, re.IGNORECASE)
++        if addresses:
++            result.mailing_address = addresses[0]
++
++        return result if (result.phones or result.emails) else None
++
++    # ── Source 2: BatchSkipTracing ────────────────────────────────────
++
++    async def _batch_skip_trace(
++        self,
++        first: str,
++        last: str,
++        address: Optional[str],
++        city: Optional[str],
++        state: Optional[str],
++        zip_code: Optional[str],
++    ) -> Optional[SkipTraceResult]:
++        """BatchSkipTracing.com API integration."""
++        try:
++            async with httpx.AsyncClient(timeout=30) as client:
++                payload = {
++                    "api_key": self.batch_skip_key,
++                    "first_name": first,
++                    "last_name": last,
++                }
++                if address:
++                    payload["address"] = address
++                if city:
++                    payload["city"] = city
++                if state:
++                    payload["state"] = state
++                if zip_code:
++                    payload["zip"] = zip_code
++
++                resp = await client.post(
++                    "https://api.batchskiptracing.com/v1/skip-trace",
++                    json=payload,
++                )
++
++                if resp.status_code != 200:
++                    logger.warning(f"BatchSkip API error: {resp.status_code}")
++                    return None
++
++                data = resp.json()
++                return self._parse_batch_skip(data, first, last)
++
++        except Exception as e:
++            logger.warning(f"BatchSkip lookup failed: {e}")
++            return None
++
++    def _parse_batch_skip(
++        self, data: dict, first: str, last: str
++    ) -> Optional[SkipTraceResult]:
++        """Parse BatchSkipTracing API response."""
++        result = SkipTraceResult(
++            person_name=f"{first} {last}",
++            first_name=first,
++            last_name=last,
++            skip_trace_source="batch_skip_tracing",
++            skip_trace_timestamp=datetime.now(),
++        )
++
++        # Phones
++        for phone in data.get("phones", []):
++            result.phones.append({
++                "number": phone.get("number", ""),
++                "type": phone.get("type", "Unknown"),
++                "provider": phone.get("carrier", ""),
++                "dnc_status": "unchecked",
++            })
++
++        # Emails
++        result.emails = data.get("emails", [])
++
++        # Address
++        addr = data.get("address", {})
++        result.mailing_address = addr.get("street", "")
++        result.mailing_city = addr.get("city", "")
++        result.mailing_state = addr.get("state", "")
++        result.mailing_zip = addr.get("zip", "")
++
++        # Age
++        result.age = str(data.get("age", ""))
++
++        # Relatives
++        for rel in data.get("relatives", []):
++            result.relatives.append({
++                "name": rel.get("name", ""),
++                "age": rel.get("age", ""),
++            })
++
++        result.confidence_score = data.get("confidence", 0.5)
++        return result
++
++    # ── Source 3: PropStream ──────────────────────────────────────────
++
++    async def _propstream_lookup(
++        self,
++        address: str,
++        city: Optional[str],
++        state: Optional[str],
++        zip_code: Optional[str],
++    ) -> Optional[SkipTraceResult]:
++        """PropStream API - property-based owner lookup with skip trace."""
++        try:
++            async with httpx.AsyncClient(timeout=30) as client:
++                resp = await client.get(
++                    "https://api.propstream.com/v1/property/search",
++                    params={
++                        "address": address,
++                        "city": city or "",
++                        "state": state or "",
++                        "zip": zip_code or "",
++                    },
++                    headers={"Authorization": f"Bearer {self.propstream_key}"},
++                )
++
++                if resp.status_code != 200:
++                    return None
++
++                data = resp.json()
++                properties = data.get("properties", [])
++                if not properties:
++                    return None
++
++                prop = properties[0]
++                owner = prop.get("owner", {})
++
++                result = SkipTraceResult(
++                    person_name=owner.get("name", "Unknown"),
++                    first_name=owner.get("first_name", ""),
++                    last_name=owner.get("last_name", ""),
++                    mailing_address=owner.get("mailing_address", ""),
++                    mailing_city=owner.get("mailing_city", ""),
++                    mailing_state=owner.get("mailing_state", ""),
++                    mailing_zip=owner.get("mailing_zip", ""),
++                    skip_trace_source="propstream",
++                    skip_trace_timestamp=datetime.now(),
++                )
++
++                # PropStream includes phone/email in enhanced results
++                for phone in owner.get("phones", []):
++                    result.phones.append({
++                        "number": phone.get("number", ""),
++                        "type": phone.get("type", ""),
++                        "dnc_status": "unchecked",
++                    })
++                result.emails = owner.get("emails", [])
++
++                return result
++
++        except Exception as e:
++            logger.warning(f"PropStream lookup failed: {e}")
++            return None
++
++    # ── Source 4: REISkip ─────────────────────────────────────────────
++
++    async def _reiskip_lookup(
++        self,
++        first: str,
++        last: str,
++        address: Optional[str],
++        city: Optional[str],
++        state: Optional[str],
++    ) -> Optional[SkipTraceResult]:
++        """REISkip API - real estate investor focused skip trace."""
++        try:
++            async with httpx.AsyncClient(timeout=30) as client:
++                payload = {
++                    "api_key": self.reiskip_key,
++                    "first_name": first,
++                    "last_name": last,
++                }
++                if address:
++                    payload["property_address"] = address
++                if city:
++                    payload["property_city"] = city
++                if state:
++                    payload["property_state"] = state
++
++                resp = await client.post(
++                    "https://api.reiskip.com/v1/trace",
++                    json=payload,
++                )
++
++                if resp.status_code != 200:
++                    return None
++
++                data = resp.json()
++                person = data.get("person", {})
++
++                result = SkipTraceResult(
++                    person_name=f"{first} {last}",
++                    first_name=first,
++                    last_name=last,
++                    skip_trace_source="reiskip",
++                    skip_trace_timestamp=datetime.now(),
++                )
++
++                for phone in person.get("phones", []):
++                    result.phones.append({
++                        "number": phone.get("number", ""),
++                        "type": phone.get("line_type", ""),
++                        "dnc_status": phone.get("dnc_status", "unchecked"),
++                    })
++
++                result.emails = person.get("emails", [])
++                result.linkedin_url = person.get("linkedin", "")
++                result.confidence_score = person.get("match_score", 0.5)
++
++                return result
++
++        except Exception as e:
++            logger.warning(f"REISkip lookup failed: {e}")
++            return None
++
++    # ── DNC Registry Check ────────────────────────────────────────────
++
++    async def check_dnc(self, phone_number: str) -> bool:
++        """
++        Check phone against National Do Not Call Registry.
++        Returns True if phone IS on the DNC list (do not call).
++        
++        Production: Use DNC.com API or internal DNC database.
++        """
++        # Clean phone to 10 digits
++        clean = re.sub(r'[^\d]', '', phone_number)
++        if len(clean) == 11 and clean.startswith("1"):
++            clean = clean[1:]
++
++        if len(clean) != 10:
++            return True  # Invalid phone = don't call
++
++        # TODO: Integrate DNC.com API ($0.005/check)
++        # For now, flag as unchecked
++        logger.debug(f"DNC check needed for: {clean}")
++        return False
++
++    async def validate_phones(self, result: SkipTraceResult) -> SkipTraceResult:
++        """Check all phones against DNC registry."""
++        for phone in result.phones:
++            is_dnc = await self.check_dnc(phone.get("number", ""))
++            phone["dnc_status"] = "do_not_call" if is_dnc else "clear"
++        result.dnc_checked = True
++        return result
++
++    # ── Helpers ────────────────────────────────────────────────────────
++
++    @staticmethod
++    def _parse_name(full_name: str) -> tuple[str, str]:
++        """Parse full name into first, last."""
++        # Remove entity suffixes
++        clean = re.sub(
++            r',?\s*(LLC|L\.L\.C\.|Inc\.|Corp\.|Ltd\.|L\.P\.|LP)\.?$',
++            '', full_name, flags=re.IGNORECASE
++        ).strip()
++
++        parts = clean.split()
++        if len(parts) == 0:
++            return ("", "")
++        elif len(parts) == 1:
++            return (parts[0], "")
++        else:
++            return (parts[0], " ".join(parts[1:]))
+diff --git a/ghl_integration/__init__.py b/ghl_integration/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/ghl_integration/client.py b/ghl_integration/client.py
+new file mode 100644
+index 0000000..3d41109
+--- /dev/null
++++ b/ghl_integration/client.py
+@@ -0,0 +1,502 @@
++"""
++GHL Integration — Push scored leads into GoHighLevel CRM
++Uses Private Integration Token (API v2) for authentication.
++Handles: contacts, opportunities, tags, custom fields, webhooks.
++"""
++import os
++from typing import Optional
++
++import httpx
++from loguru import logger
++from tenacity import retry, stop_after_attempt, wait_exponential
++
++from lead_engine.scoring import ScoredLead
++
++
++class GHLClient:
++    """
++    GoHighLevel API v2 client using Private Integration Token.
++    
++    Setup:
++    1. GHL Settings → Other Settings → Private Integrations
++    2. Create integration: "TILT Lead Engine"
++    3. Select scopes: contacts.write, opportunities.write, tags.write,
++       custom-fields.write, conversations.write, calendars.write
++    4. Copy token → GHL_PRIVATE_TOKEN in .env
++    """
++
++    BASE_URL = "https://services.leadconnectorhq.com"
++    API_VERSION = "2021-07-28"
++
++    def __init__(
++        self,
++        token: Optional[str] = None,
++        location_id: Optional[str] = None,
++        pipeline_id: Optional[str] = None,
++    ):
++        self.token = token or os.getenv("GHL_PRIVATE_TOKEN")
++        self.location_id = location_id or os.getenv("GHL_LOCATION_ID")
++        self.pipeline_id = pipeline_id or os.getenv("GHL_PIPELINE_ID")
++
++        if not self.token:
++            raise ValueError(
++                "GHL_PRIVATE_TOKEN required. Create at: "
++                "GHL Settings → Other Settings → Private Integrations"
++            )
++
++        self.headers = {
++            "Authorization": f"Bearer {self.token}",
++            "Content-Type": "application/json",
++            "Version": self.API_VERSION,
++        }
++
++        # Stage IDs — set after creating pipeline in GHL
++        self.stage_ids = {
++            "permit_detected": os.getenv("GHL_STAGE_PERMIT_DETECTED", ""),
++            "qualified": os.getenv("GHL_STAGE_QUALIFIED", ""),
++            "contacted": os.getenv("GHL_STAGE_CONTACTED", ""),
++            "engaged": os.getenv("GHL_STAGE_ENGAGED", ""),
++            "application": os.getenv("GHL_STAGE_APPLICATION", ""),
++            "underwriting": os.getenv("GHL_STAGE_UNDERWRITING", ""),
++            "approved": os.getenv("GHL_STAGE_APPROVED", ""),
++            "funded": os.getenv("GHL_STAGE_FUNDED", ""),
++        }
++
++    # ========================================================================
++    # CONTACTS
++    # ========================================================================
++
++    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
++    async def upsert_contact(self, lead: ScoredLead) -> dict:
++        """
++        Create or update a contact in GHL.
++        Uses upsert to avoid duplicates (matches on email or phone).
++        """
++        permit = lead.permit
++
++        # Parse owner name into first/last
++        owner = permit.owner_entity or permit.owner_name or ""
++        name_parts = owner.split() if owner else ["Unknown"]
++        first_name = name_parts[0] if name_parts else "Unknown"
++        last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
++
++        # Build tier tag
++        tier_tags = {
++            1: "T1-HOT",
++            2: "T2-WARM",
++            3: "T3-NURTURE",
++            4: "T4-MONITOR",
++        }
++
++        # Build source tag
++        source_tag = f"source-openshovels-{permit.jurisdiction}"
++
++        # Project type tag
++        project_tag = f"project-{permit.ai_project_classification.value}" if permit.ai_project_classification else "project-unknown"
++
++        payload = {
++            "locationId": self.location_id,
++            "firstName": first_name,
++            "lastName": last_name,
++            "companyName": permit.owner_entity or "",
++            "address1": permit.address,
++            "city": permit.city,
++            "state": permit.state,
++            "postalCode": permit.zip_code or "",
++            "tags": [
++                tier_tags.get(lead.tier, "T4-MONITOR"),
++                source_tag,
++                project_tag,
++                "lead-engine-auto",
++                f"tier-{lead.tier}",
++            ],
++            "customFields": self._build_custom_fields(lead),
++        }
++
++        # Overlay skip trace contact info if available
++        enrichment = permit.enrichment
++        if enrichment and enrichment.skip_trace:
++            st = enrichment.skip_trace
++
++            # Use skip trace name (actual person, not entity)
++            if st.first_name:
++                payload["firstName"] = st.first_name
++            if st.last_name:
++                payload["lastName"] = st.last_name
++
++            # Phone — use first non-DNC phone
++            clear_phones = [
++                p for p in st.phones
++                if p.get("dnc_status") != "do_not_call"
++            ]
++            if clear_phones:
++                payload["phone"] = clear_phones[0].get("number", "")
++
++            # Email
++            if st.emails:
++                payload["email"] = st.emails[0]
++
++            # Mailing address (investor's actual address, not property)
++            if st.mailing_address:
++                payload["address1"] = st.mailing_address
++                if st.mailing_city:
++                    payload["city"] = st.mailing_city
++                if st.mailing_state:
++                    payload["state"] = st.mailing_state
++                if st.mailing_zip:
++                    payload["postalCode"] = st.mailing_zip
++
++            # Add enrichment-specific tags
++            payload["tags"].append("has-contact-info")
++            if st.dnc_checked:
++                payload["tags"].append("dnc-verified")
++        elif enrichment and enrichment.entity and enrichment.entity.registered_agent_name:
++            # At least use the registered agent name if no skip trace
++            agent = enrichment.entity.registered_agent_name
++            agent_parts = agent.split()
++            if agent_parts:
++                payload["firstName"] = agent_parts[0]
++                payload["lastName"] = " ".join(agent_parts[1:]) if len(agent_parts) > 1 else ""
++            payload["tags"].append("needs-skip-trace")
++
++        async with httpx.AsyncClient(timeout=30) as client:
++            resp = await client.post(
++                f"{self.BASE_URL}/contacts/upsert",
++                json=payload,
++                headers=self.headers,
++            )
++
++            if resp.status_code == 200 or resp.status_code == 201:
++                data = resp.json()
++                contact_id = data.get("contact", {}).get("id")
++                logger.info(
++                    f"GHL contact upserted: {contact_id} | "
++                    f"{permit.owner_entity} | T{lead.tier} | "
++                    f"Score: {lead.composite_score}"
++                )
++                return data
++            elif resp.status_code == 429:
++                logger.warning("GHL rate limited — will retry")
++                raise httpx.HTTPError("Rate limited")
++            else:
++                logger.error(
++                    f"GHL contact upsert failed: {resp.status_code} | "
++                    f"{resp.text[:200]}"
++                )
++                resp.raise_for_status()
++
++    # ========================================================================
++    # OPPORTUNITIES
++    # ========================================================================
++
++    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
++    async def create_opportunity(
++        self,
++        contact_id: str,
++        lead: ScoredLead,
++    ) -> dict:
++        """Create a deal in the TILT Construction Lending pipeline."""
++        permit = lead.permit
++
++        # Determine starting stage based on tier
++        if lead.tier <= 2:
++            stage_id = self.stage_ids["qualified"]
++        else:
++            stage_id = self.stage_ids["permit_detected"]
++
++        # Calculate monetary value
++        value = permit.ai_value_estimated or permit.job_value
++        monetary_value = float(value) if value else 0
++
++        # Build opportunity name
++        project_type = (
++            permit.ai_project_classification.value.replace("_", " ").title()
++            if permit.ai_project_classification
++            else "Construction"
++        )
++        units = permit.unit_count or permit.ai_unit_count_estimated or "?"
++        name = f"{permit.owner_entity or 'Unknown'} — {units}-Unit {project_type} {permit.city}"
++
++        payload = {
++            "pipelineId": self.pipeline_id,
++            "locationId": self.location_id,
++            "name": name,
++            "stageId": stage_id,
++            "status": "open",
++            "contactId": contact_id,
++            "monetaryValue": monetary_value,
++        }
++
++        async with httpx.AsyncClient(timeout=30) as client:
++            resp = await client.post(
++                f"{self.BASE_URL}/opportunities/",
++                json=payload,
++                headers=self.headers,
++            )
++
++            if resp.status_code in (200, 201):
++                data = resp.json()
++                opp_id = data.get("opportunity", {}).get("id")
++                logger.info(
++                    f"GHL opportunity created: {opp_id} | "
++                    f"{name} | ${monetary_value:,.0f} | "
++                    f"Stage: {'qualified' if lead.tier <= 2 else 'permit_detected'}"
++                )
++                return data
++            elif resp.status_code == 429:
++                logger.warning("GHL rate limited — will retry")
++                raise httpx.HTTPError("Rate limited")
++            else:
++                logger.error(
++                    f"GHL opportunity create failed: {resp.status_code} | "
++                    f"{resp.text[:200]}"
++                )
++                resp.raise_for_status()
++
++    # ========================================================================
++    # TAGS
++    # ========================================================================
++
++    @retry(stop=stop_after_attempt(2), wait=wait_exponential(min=1, max=5))
++    async def apply_tags(self, contact_id: str, tags: list[str]) -> dict:
++        """Apply tags to trigger GHL workflows."""
++        async with httpx.AsyncClient(timeout=15) as client:
++            resp = await client.post(
++                f"{self.BASE_URL}/contacts/{contact_id}/tags",
++                json={"tags": tags},
++                headers=self.headers,
++            )
++            if resp.status_code in (200, 201):
++                return resp.json()
++            else:
++                logger.warning(f"GHL tag apply failed: {resp.status_code}")
++                return {}
++
++    # ========================================================================
++    # SEARCH (dedup check)
++    # ========================================================================
++
++    async def search_contact(self, query: str) -> Optional[dict]:
++        """Search for existing contact to prevent duplicates."""
++        async with httpx.AsyncClient(timeout=15) as client:
++            resp = await client.get(
++                f"{self.BASE_URL}/contacts/search",
++                params={"locationId": self.location_id, "query": query},
++                headers=self.headers,
++            )
++            if resp.status_code == 200:
++                data = resp.json()
++                contacts = data.get("contacts", [])
++                return contacts[0] if contacts else None
++            return None
++
++    # ========================================================================
++    # HELPERS
++    # ========================================================================
++
++    def _build_custom_fields(self, lead: ScoredLead) -> list[dict]:
++        """Map scored lead data + enrichment to GHL custom fields."""
++        permit = lead.permit
++        scores = lead.scores
++
++        fields = [
++            # Lead Intelligence
++            {"key": "composite_score", "value": str(lead.composite_score)},
++            {"key": "lead_tier", "value": f"T{lead.tier}-{lead.tier_name}"},
++            {"key": "lead_source_detail", "value": f"OpenShovels-{permit.jurisdiction}"},
++            {"key": "scoring_timestamp", "value": lead.scored_at},
++
++            # Project Details
++            {"key": "project_type", "value": permit.ai_project_classification.value if permit.ai_project_classification else "unknown"},
++            {"key": "unit_count", "value": str(permit.unit_count or permit.ai_unit_count_estimated or "")},
++            {"key": "property_address", "value": permit.address},
++            {"key": "estimated_project_value", "value": str(permit.ai_value_estimated or permit.job_value or "")},
++            {"key": "owner_occupied", "value": "Non-Owner-Occupied" if permit.ai_is_investor_noo else "Unknown"},
++
++            # Permit Data
++            {"key": "permit_number", "value": permit.permit_id},
++            {"key": "permit_type", "value": permit.permit_type.value},
++            {"key": "permit_status", "value": permit.permit_status.value},
++            {"key": "permit_value", "value": str(permit.job_value or "")},
++            {"key": "permit_date", "value": str(permit.issued_date or permit.filed_date or "")},
++            {"key": "permit_expiration", "value": str(permit.expiration_date or "")},
++
++            # Borrower Profile
++            {"key": "entity_name", "value": permit.owner_entity or ""},
++
++            # Scoring Components
++            {"key": "score_project_fit", "value": str(scores.project_fit)},
++            {"key": "score_borrower", "value": str(scores.borrower_profile)},
++            {"key": "score_market", "value": str(scores.market_strength)},
++            {"key": "score_timing", "value": str(scores.timing_signal)},
++            {"key": "score_conversion", "value": str(scores.conversion_prob)},
++        ]
++
++        # === Enrichment Data ===
++        enrichment = permit.enrichment
++        if enrichment:
++            # Entity Resolution
++            if enrichment.entity:
++                ent = enrichment.entity
++                fields.extend([
++                    {"key": "entity_type", "value": ent.entity_type or ""},
++                    {"key": "entity_status", "value": ent.status or ""},
++                    {"key": "registered_agent", "value": ent.registered_agent_name or ""},
++                    {"key": "registered_agent_address", "value": ent.registered_agent_address or ""},
++                    {"key": "principal_office", "value": ent.principal_office_address or ""},
++                    {"key": "entity_principals", "value": ", ".join(ent.principals[:3]) if ent.principals else ""},
++                    {"key": "sos_filing_number", "value": ent.sos_filing_number or ""},
++                    {"key": "entity_state", "value": ent.state_of_formation or ""},
++                    {"key": "other_properties_count", "value": str(ent.other_properties_count or "")},
++                    {"key": "entity_lookup_source", "value": ent.lookup_source or ""},
++                ])
++
++            # Skip Trace — Contact Info
++            if enrichment.skip_trace:
++                st = enrichment.skip_trace
++                # Primary phone (first non-DNC)
++                clear_phones = [
++                    p for p in st.phones
++                    if p.get("dnc_status") != "do_not_call"
++                ]
++                if clear_phones:
++                    fields.append({"key": "skip_phone_1", "value": clear_phones[0].get("number", "")})
++                    fields.append({"key": "skip_phone_1_type", "value": clear_phones[0].get("type", "")})
++                if len(clear_phones) > 1:
++                    fields.append({"key": "skip_phone_2", "value": clear_phones[1].get("number", "")})
++                if len(clear_phones) > 2:
++                    fields.append({"key": "skip_phone_3", "value": clear_phones[2].get("number", "")})
++
++                # Emails
++                if st.emails:
++                    fields.append({"key": "skip_email_1", "value": st.emails[0]})
++                if len(st.emails) > 1:
++                    fields.append({"key": "skip_email_2", "value": st.emails[1]})
++
++                # Mailing address
++                if st.mailing_address:
++                    mailing = st.mailing_address
++                    if st.mailing_city:
++                        mailing += f", {st.mailing_city}"
++                    if st.mailing_state:
++                        mailing += f", {st.mailing_state}"
++                    if st.mailing_zip:
++                        mailing += f" {st.mailing_zip}"
++                    fields.append({"key": "skip_mailing_address", "value": mailing})
++
++                fields.extend([
++                    {"key": "skip_person_name", "value": st.person_name or ""},
++                    {"key": "skip_confidence", "value": str(st.confidence_score or "")},
++                    {"key": "skip_linkedin", "value": st.linkedin_url or ""},
++                    {"key": "skip_dnc_checked", "value": "Yes" if st.dnc_checked else "No"},
++                    {"key": "skip_source", "value": st.skip_trace_source or ""},
++                ])
++
++            # Property Intelligence
++            if enrichment.property_intel:
++                prop = enrichment.property_intel
++                fields.extend([
++                    {"key": "prop_owner_name", "value": prop.owner_name or ""},
++                    {"key": "prop_assessed_value", "value": str(prop.assessed_value or "")},
++                    {"key": "prop_market_value", "value": str(prop.market_value or "")},
++                    {"key": "prop_last_sale_price", "value": str(prop.last_sale_price or "")},
++                    {"key": "prop_last_sale_date", "value": str(prop.last_sale_date or "")},
++                    {"key": "prop_mortgage_amount", "value": str(prop.mortgage_amount or "")},
++                    {"key": "prop_mortgage_lender", "value": prop.mortgage_lender or ""},
++                    {"key": "prop_equity_estimate", "value": str(prop.equity_estimate or "")},
++                    {"key": "prop_year_built", "value": str(prop.year_built or "")},
++                    {"key": "prop_zoning", "value": prop.zoning or ""},
++                    {"key": "prop_rental_estimate", "value": str(prop.rental_estimate or "")},
++                    {"key": "prop_arv_estimate", "value": str(prop.arv_estimate or "")},
++                    {"key": "prop_noo_mailing", "value": prop.owner_mailing_address or ""},
++                ])
++
++            # News Intelligence
++            if enrichment.news_intel:
++                news = enrichment.news_intel
++                flags = []
++                if news.has_zoning_issues:
++                    flags.append("ZONING")
++                if news.has_community_opposition:
++                    flags.append("OPPOSITION")
++                if news.has_tax_incentives:
++                    flags.append("INCENTIVES")
++                if news.has_litigation:
++                    flags.append("LITIGATION")
++
++                fields.extend([
++                    {"key": "news_flags", "value": ", ".join(flags) if flags else "None"},
++                    {"key": "news_hit_count", "value": str(news.total_hits)},
++                    {"key": "news_ai_summary", "value": (news.ai_summary or "")[:500]},
++                ])
++
++            # Contractor Intelligence
++            if enrichment.contractor:
++                gc = enrichment.contractor
++                fields.extend([
++                    {"key": "contractor_permits_active", "value": str(gc.active_permits_count)},
++                    {"key": "contractor_total_value", "value": str(gc.total_permit_value or "")},
++                    {"key": "contractor_referral_potential", "value": gc.referral_potential or ""},
++                    {"key": "contractor_jurisdictions", "value": ", ".join(gc.jurisdictions_active[:5])},
++                ])
++
++            # Enrichment meta
++            fields.extend([
++                {"key": "enrichment_layers", "value": ", ".join(enrichment.enrichment_layers_completed)},
++                {"key": "enrichment_cost", "value": f"${enrichment.enrichment_cost_usd:.4f}"},
++                {"key": "has_contact_info", "value": "Yes" if enrichment.has_contact_info else "No"},
++                {"key": "noo_confirmed", "value": "Yes" if enrichment.noo_confirmed else "No"},
++            ])
++
++        # Filter out empty values
++        return [f for f in fields if f["value"]]
++
++
++# ============================================================================
++# MAIN PIPELINE: Score → Push → Tag
++# ============================================================================
++
++async def push_leads_to_ghl(leads: list[ScoredLead]) -> dict:
++    """
++    Push a batch of scored leads into GoHighLevel.
++    Returns summary stats.
++    """
++    ghl = GHLClient()
++    stats = {"contacts_created": 0, "opportunities_created": 0, "errors": 0}
++
++    for lead in leads:
++        try:
++            # 1. Upsert contact
++            contact_result = await ghl.upsert_contact(lead)
++            contact_id = contact_result.get("contact", {}).get("id")
++            if not contact_id:
++                stats["errors"] += 1
++                continue
++            stats["contacts_created"] += 1
++
++            # 2. Create opportunity (only for T1-T3)
++            if lead.tier <= 3:
++                await ghl.create_opportunity(contact_id, lead)
++                stats["opportunities_created"] += 1
++
++            # 3. Apply workflow-triggering tags
++            tier_tags = {
++                1: ["T1-HOT"],
++                2: ["T2-WARM"],
++                3: ["T3-NURTURE"],
++                4: ["T4-MONITOR"],
++            }
++            await ghl.apply_tags(contact_id, tier_tags.get(lead.tier, []))
++
++        except Exception as e:
++            stats["errors"] += 1
++            logger.error(
++                f"GHL push failed for {lead.permit.permit_id}: {e}"
++            )
++
++    logger.info(
++        f"GHL push complete: {stats['contacts_created']} contacts, "
++        f"{stats['opportunities_created']} opportunities, "
++        f"{stats['errors']} errors"
++    )
++    return stats
+diff --git a/lead_engine/__init__.py b/lead_engine/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/lead_engine/qualify.py b/lead_engine/qualify.py
+new file mode 100644
+index 0000000..3733145
+--- /dev/null
++++ b/lead_engine/qualify.py
+@@ -0,0 +1,163 @@
++"""
++TILT Qualification Filter
++Determines which permits qualify for TILT construction lending.
++
++Deal Size Tiers:
++  SMALL:         $2M - $5M    (heavy rehab, small multifamily)
++  CORE:          $5M - $15M   (ground-up 1-4 unit, mid-market)
++  LARGE:         $15M - $50M  (large multifamily, mixed-use)
++  INSTITUTIONAL: $50M - $100M (institutional scale)
++
++All tiers qualify — scoring differentiates priority.
++"""
++from decimal import Decimal
++from enum import Enum
++from typing import Optional
++
++from loguru import logger
++
++from openshovels.schema import (
++    StandardPermit, ProjectClassification, PropertyType
++)
++
++
++# === Deal Size Tiers ===
++class DealTier(str, Enum):
++    SMALL = "small"              # $2M - $5M
++    CORE = "core"                # $5M - $15M
++    LARGE = "large"              # $15M - $50M
++    INSTITUTIONAL = "institutional"  # $50M - $100M
++    UNKNOWN = "unknown"
++
++
++# === TILT Lending Criteria ===
++MIN_UNITS = 1
++MAX_UNITS = 4
++MIN_VALUE = Decimal("2000000")    # $2M floor
++MAX_VALUE = Decimal("100000000")  # $100M ceiling
++
++QUALIFYING_CLASSIFICATIONS = {
++    ProjectClassification.GROUND_UP,
++    ProjectClassification.HEAVY_REHAB,
++    ProjectClassification.GUT_RENOVATION,
++    ProjectClassification.MODERATE_REHAB,  # Include at $2M+ these are real deals
++}
++
++QUALIFYING_PROPERTY_TYPES = {
++    PropertyType.SINGLE_FAMILY,
++    PropertyType.DUPLEX,
++    PropertyType.TRIPLEX,
++    PropertyType.FOURPLEX,
++    PropertyType.MIXED_USE,
++    PropertyType.MULTI_5PLUS,  # Now qualifying — larger deals welcome
++}
++
++
++def classify_deal_tier(value: Optional[Decimal]) -> DealTier:
++    """Classify a deal into a size tier based on estimated value."""
++    if value is None:
++        return DealTier.UNKNOWN
++    val = float(value)
++    if val < 2_000_000:
++        return DealTier.UNKNOWN  # Below minimum
++    elif val < 5_000_000:
++        return DealTier.SMALL
++    elif val < 15_000_000:
++        return DealTier.CORE
++    elif val < 50_000_000:
++        return DealTier.LARGE
++    elif val <= 100_000_000:
++        return DealTier.INSTITUTIONAL
++    else:
++        return DealTier.UNKNOWN  # Above ceiling
++
++
++def qualify_permit(permit: StandardPermit) -> StandardPermit:
++    """
++    Apply TILT lending criteria to a permit.
++    Sets tilt_qualified, tilt_disqualify_reason, and deal tier tag.
++    """
++    reasons = []
++
++    # --- Unit Count Check (relaxed for larger deals) ---
++    units = permit.unit_count or permit.ai_unit_count_estimated
++    value = permit.ai_value_estimated or permit.job_value
++    deal_tier = classify_deal_tier(value)
++
++    if units is not None:
++        # For SMALL/CORE: enforce 1-4 unit limit
++        if deal_tier in (DealTier.SMALL, DealTier.CORE, DealTier.UNKNOWN):
++            if units < MIN_UNITS or units > MAX_UNITS:
++                reasons.append(f"unit_count={units} (need {MIN_UNITS}-{MAX_UNITS} for {deal_tier.value} tier)")
++        # For LARGE/INSTITUTIONAL: allow up to 50 units
++        elif deal_tier in (DealTier.LARGE, DealTier.INSTITUTIONAL):
++            if units > 50:
++                reasons.append(f"unit_count={units} (max 50 for {deal_tier.value} tier)")
++
++    # --- Property Type Check (relaxed for larger deals) ---
++    if deal_tier in (DealTier.SMALL, DealTier.CORE, DealTier.UNKNOWN):
++        if permit.property_type == PropertyType.COMMERCIAL:
++            reasons.append("property_type=commercial (need residential/mixed-use)")
++    # LARGE and INSTITUTIONAL can include commercial with residential component
++
++    # --- Project Classification Check ---
++    classification = permit.ai_project_classification
++    if classification and classification not in QUALIFYING_CLASSIFICATIONS:
++        reasons.append(
++            f"classification={classification.value} "
++            f"(need ground_up/heavy_rehab/gut_renovation/moderate_rehab)"
++        )
++
++    # --- Value Check ---
++    if value is not None:
++        if value < MIN_VALUE:
++            reasons.append(f"value=${value:,.0f} (need >=${MIN_VALUE:,.0f})")
++        elif value > MAX_VALUE:
++            reasons.append(f"value=${value:,.0f} (need <=${MAX_VALUE:,.0f})")
++
++    # --- NOO Check ---
++    if permit.ai_is_investor_noo is False:
++        reasons.append("owner_occupied=true (need NOO)")
++
++    # --- Set Qualification ---
++    if reasons:
++        permit.tilt_qualified = False
++        permit.tilt_disqualify_reason = "; ".join(reasons)
++    else:
++        if permit.ai_confidence and permit.ai_confidence < 0.5:
++            permit.tilt_qualified = None
++            permit.tilt_disqualify_reason = f"low_ai_confidence={permit.ai_confidence}"
++        else:
++            permit.tilt_qualified = True
++            permit.tilt_disqualify_reason = None
++
++    # Tag with deal tier for GHL routing
++    if permit.tilt_qualified and deal_tier != DealTier.UNKNOWN:
++        permit.ai_tags = list(set(permit.ai_tags + [f"deal-{deal_tier.value}"]))
++
++    return permit
++
++
++def filter_qualified(permits: list[StandardPermit]) -> list[StandardPermit]:
++    """Filter a list of permits to only TILT-qualified ones."""
++    qualified = []
++    tier_counts = {t: 0 for t in DealTier}
++
++    for permit in permits:
++        permit = qualify_permit(permit)
++        if permit.tilt_qualified is True:
++            qualified.append(permit)
++            value = permit.ai_value_estimated or permit.job_value
++            tier = classify_deal_tier(value)
++            tier_counts[tier] += 1
++
++    tier_summary = " | ".join(
++        f"{t.value}={c}" for t, c in tier_counts.items() if c > 0
++    )
++
++    logger.info(
++        f"TILT filter: {len(qualified)}/{len(permits)} qualified "
++        f"({len(qualified)/max(len(permits),1)*100:.1f}%) "
++        f"[{tier_summary or 'none'}]"
++    )
++    return qualified
+diff --git a/lead_engine/score_and_push.py b/lead_engine/score_and_push.py
+new file mode 100644
+index 0000000..5a9069b
+--- /dev/null
++++ b/lead_engine/score_and_push.py
+@@ -0,0 +1,416 @@
++"""
++TILT Construction Lead Engine — Main Orchestrator
++Runs the full pipeline: Ingest → Enrich → Qualify → Score → Push to GHL
++
++Usage:
++    # One-time run
++    python lead_engine/score_and_push.py
++
++    # Run specific jurisdiction
++    python lead_engine/score_and_push.py --jurisdiction ct_hartford
++
++    # Dry run (score but don't push to GHL)
++    python lead_engine/score_and_push.py --dry-run
++
++    # Scheduled (every 15 minutes)
++    python lead_engine/score_and_push.py --scheduled
++"""
++import asyncio
++import os
++import sys
++import argparse
++from datetime import datetime, timedelta
++
++from dotenv import load_dotenv
++from loguru import logger
++from rich.console import Console
++from rich.table import Table
++
++# Add project root to path
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++
++load_dotenv("config/.env")
++
++from openshovels.pipeline.enrich import PermitEnricher
++from lead_engine.qualify import filter_qualified
++from lead_engine.scoring import score_batch, ScoredLead
++from enrichment.orchestrator import EnrichmentOrchestrator
++from ghl_integration.client import push_leads_to_ghl
++
++console = Console()
++
++
++# === Jurisdiction Registry ===
++JURISDICTION_SCRAPERS = {
++    "ct_hartford": "openshovels.jurisdictions.ct_hartford.scraper.HartfordScraper",
++    # Add as you build more scrapers:
++    # "ri_providence": "openshovels.jurisdictions.ri_providence.scraper.ProvidenceScraper",
++    # "ma_boston": "openshovels.jurisdictions.ma_boston.scraper.BostonScraper",
++    # "ny_nyc": "openshovels.jurisdictions.ny_nyc.scraper.NYCScraper",
++    # "nj_newark": "openshovels.jurisdictions.nj_newark.scraper.NewarkScraper",
++}
++
++
++def load_scraper(jurisdiction: str):
++    """Dynamically load a jurisdiction scraper class."""
++    module_path = JURISDICTION_SCRAPERS.get(jurisdiction)
++    if not module_path:
++        raise ValueError(
++            f"Unknown jurisdiction: {jurisdiction}. "
++            f"Available: {list(JURISDICTION_SCRAPERS.keys())}"
++        )
++    module_name, class_name = module_path.rsplit(".", 1)
++    import importlib
++    module = importlib.import_module(module_name)
++    return getattr(module, class_name)()
++
++
++async def run_pipeline(
++    jurisdictions: list[str],
++    since: datetime = None,
++    dry_run: bool = False,
++    limit: int = None,
++    skip_enrichment: bool = False,
++    enrichment_layers: list[str] = None,
++    enrichment_concurrency: int = 3,
++) -> dict:
++    """
++    Full pipeline execution.
++    
++    1. INGEST — Scrape permits from each jurisdiction
++    2. ENRICH (AI) — AI classification via Grok (cheap, bulk)
++    3. QUALIFY — Filter to TILT lending criteria
++    4. SCORE — 5-dimension composite scoring
++    5. ENRICH (DEEP) — Entity resolution, skip trace, property, news, contractor
++    6. PUSH — Send enriched leads to GoHighLevel CRM
++    """
++    stats = {
++        "jurisdictions": len(jurisdictions),
++        "raw_permits": 0,
++        "enriched": 0,
++        "qualified": 0,
++        "scored": 0,
++        "t1_hot": 0,
++        "t2_warm": 0,
++        "t3_nurture": 0,
++        "t4_monitor": 0,
++        "deep_enriched": 0,
++        "contacts_found": 0,
++        "entities_resolved": 0,
++        "properties_looked_up": 0,
++        "news_hits": 0,
++        "enrichment_cost": 0.0,
++        "ghl_contacts": 0,
++        "ghl_opportunities": 0,
++        "errors": 0,
++    }
++
++    all_scored: list[ScoredLead] = []
++
++    # Initialize AI enricher
++    grok_key = os.getenv("GROK_API_KEY")
++    enricher = None
++    if grok_key:
++        enricher = PermitEnricher(api_key=grok_key, model=os.getenv("GROK_MODEL", "grok-3-mini"))
++    else:
++        logger.warning("GROK_API_KEY not set — skipping AI enrichment")
++
++    for jurisdiction in jurisdictions:
++        console.rule(f"[bold]{jurisdiction.upper()}")
++
++        # --- STEP 1: INGEST ---
++        try:
++            scraper = load_scraper(jurisdiction)
++            batch = await scraper.run(since=since, limit=limit)
++            stats["raw_permits"] += batch.record_count
++            logger.info(f"INGEST: {batch.record_count} raw permits from {jurisdiction}")
++        except Exception as e:
++            logger.error(f"INGEST FAILED for {jurisdiction}: {e}")
++            stats["errors"] += 1
++            continue
++
++        if not batch.permits:
++            logger.info(f"No permits found for {jurisdiction} — skipping")
++            continue
++
++        # --- STEP 2: ENRICH ---
++        permits = batch.permits
++        if enricher:
++            permits = await enricher.enrich_batch(permits, concurrency=5)
++            stats["enriched"] += len(permits)
++            logger.info(f"ENRICH: {len(permits)} permits AI-classified")
++        else:
++            stats["enriched"] += len(permits)
++
++        # --- STEP 3: QUALIFY ---
++        qualified = filter_qualified(permits)
++        stats["qualified"] += len(qualified)
++        logger.info(f"QUALIFY: {len(qualified)}/{len(permits)} meet TILT criteria")
++
++        if not qualified:
++            logger.info(f"No qualified permits in {jurisdiction}")
++            continue
++
++        # --- STEP 4: SCORE ---
++        scored = score_batch(qualified)
++        stats["scored"] += len(scored)
++        for s in scored:
++            stats[f"t{s.tier}_{'hot' if s.tier==1 else 'warm' if s.tier==2 else 'nurture' if s.tier==3 else 'monitor'}"] += 1
++        all_scored.extend(scored)
++
++    # --- STEP 5: DEEP ENRICHMENT (Entity, Skip Trace, Property, News, Contractor) ---
++    if all_scored and not skip_enrichment:
++        console.rule("[bold blue]DEEP ENRICHMENT — Contact Discovery & Intelligence")
++
++        # Only deep-enrich T1-T3 leads (T4 not worth the cost)
++        leads_to_enrich = [s for s in all_scored if s.tier <= 3]
++        t4_leads = [s for s in all_scored if s.tier > 3]
++
++        if leads_to_enrich:
++            logger.info(
++                f"Deep enriching {len(leads_to_enrich)} T1-T3 leads "
++                f"(skipping {len(t4_leads)} T4 leads to save cost)"
++            )
++
++            enrichment_orch = EnrichmentOrchestrator()
++
++            # Extract permits from scored leads for enrichment
++            permits_to_enrich = [s.permit for s in leads_to_enrich]
++
++            try:
++                enriched_permits = await enrichment_orch.enrich_batch(
++                    permits=permits_to_enrich,
++                    concurrency=enrichment_concurrency,
++                    layers=enrichment_layers,
++                )
++
++                # Map enriched permits back onto scored leads
++                enriched_map = {p.permit_id: p for p in enriched_permits}
++                for lead in leads_to_enrich:
++                    if lead.permit.permit_id in enriched_map:
++                        lead.permit = enriched_map[lead.permit.permit_id]
++
++                # Collect stats
++                for p in enriched_permits:
++                    if p.enrichment:
++                        stats["deep_enriched"] += 1
++                        if p.enrichment.has_contact_info:
++                            stats["contacts_found"] += 1
++                        if "entity" in p.enrichment.enrichment_layers_completed:
++                            stats["entities_resolved"] += 1
++                        if "property" in p.enrichment.enrichment_layers_completed:
++                            stats["properties_looked_up"] += 1
++                        if "news" in p.enrichment.enrichment_layers_completed:
++                            news = p.enrichment.news_intel
++                            if news:
++                                stats["news_hits"] += news.total_hits
++
++                orch_stats = enrichment_orch.get_stats()
++                stats["enrichment_cost"] = orch_stats["total_cost"]
++
++                logger.info(
++                    f"DEEP ENRICHMENT: {stats['deep_enriched']}/{len(leads_to_enrich)} enriched | "
++                    f"{stats['contacts_found']} with contact info | "
++                    f"${stats['enrichment_cost']:.2f} total cost"
++                )
++
++            except Exception as e:
++                logger.error(f"Deep enrichment failed: {e}")
++                stats["errors"] += 1
++        else:
++            logger.info("No T1-T3 leads to deep enrich")
++    elif skip_enrichment:
++        console.print("[yellow]SKIP — Deep enrichment disabled[/yellow]")
++
++    # --- STEP 6: PUSH TO GHL ---
++    if all_scored and not dry_run:
++        console.rule("[bold green]PUSHING TO GOHIGHLEVEL")
++        ghl_stats = await push_leads_to_ghl(all_scored)
++        stats["ghl_contacts"] = ghl_stats["contacts_created"]
++        stats["ghl_opportunities"] = ghl_stats["opportunities_created"]
++        stats["errors"] += ghl_stats["errors"]
++    elif dry_run:
++        console.print("[yellow]DRY RUN — skipping GHL push[/yellow]")
++
++    # --- SUMMARY ---
++    print_summary(stats, all_scored)
++    return stats
++
++
++def print_summary(stats: dict, scored: list[ScoredLead]):
++    """Pretty-print pipeline results."""
++    console.print()
++    console.rule("[bold]PIPELINE SUMMARY")
++
++    # Stats table
++    table = Table(title="Run Statistics")
++    table.add_column("Metric", style="cyan")
++    table.add_column("Value", style="green", justify="right")
++
++    table.add_row("Jurisdictions", str(stats["jurisdictions"]))
++    table.add_row("Raw Permits", str(stats["raw_permits"]))
++    table.add_row("AI Enriched", str(stats["enriched"]))
++    table.add_row("TILT Qualified", str(stats["qualified"]))
++    table.add_row("Scored", str(stats["scored"]))
++    table.add_row("T1 HOT 🔥", str(stats["t1_hot"]))
++    table.add_row("T2 WARM 🟠", str(stats["t2_warm"]))
++    table.add_row("T3 NURTURE 📧", str(stats["t3_nurture"]))
++    table.add_row("T4 MONITOR 👁", str(stats["t4_monitor"]))
++    table.add_row("", "")
++    table.add_row("[bold]Deep Enrichment[/bold]", "")
++    table.add_row("  Leads Enriched", str(stats["deep_enriched"]))
++    table.add_row("  Contacts Found 📞", str(stats["contacts_found"]))
++    table.add_row("  Entities Resolved 🏢", str(stats["entities_resolved"]))
++    table.add_row("  Properties Looked Up 🏠", str(stats["properties_looked_up"]))
++    table.add_row("  News Hits 📰", str(stats["news_hits"]))
++    table.add_row("  Enrichment Cost", f"${stats['enrichment_cost']:.2f}")
++    table.add_row("", "")
++    table.add_row("→ GHL Contacts", str(stats["ghl_contacts"]))
++    table.add_row("→ GHL Opportunities", str(stats["ghl_opportunities"]))
++    table.add_row("Errors", str(stats["errors"]))
++
++    console.print(table)
++
++    # Top leads table — now with contact info
++    if scored:
++        top_table = Table(title="Top Leads (T1-T2)")
++        top_table.add_column("Score", style="bold red", justify="center")
++        top_table.add_column("Tier", justify="center")
++        top_table.add_column("Entity", style="white")
++        top_table.add_column("Project", style="cyan")
++        top_table.add_column("City", style="green")
++        top_table.add_column("Value", style="yellow", justify="right")
++        top_table.add_column("Contact", style="magenta")
++        top_table.add_column("SLA", style="dim")
++
++        for lead in scored[:10]:
++            if lead.tier <= 2:
++                value = lead.permit.ai_value_estimated or lead.permit.job_value
++                # Contact info from enrichment
++                contact = "—"
++                if lead.permit.enrichment and lead.permit.enrichment.has_contact_info:
++                    st = lead.permit.enrichment.skip_trace
++                    phone_count = len(st.phones) if st else 0
++                    email_count = len(st.emails) if st else 0
++                    contact = f"📞{phone_count} ✉{email_count}"
++                elif lead.permit.enrichment and lead.permit.enrichment.entity:
++                    ent = lead.permit.enrichment.entity
++                    if ent.registered_agent_name:
++                        contact = f"🏢 {ent.registered_agent_name[:20]}"
++
++                top_table.add_row(
++                    str(lead.composite_score),
++                    f"T{lead.tier}",
++                    lead.permit.owner_entity or lead.permit.owner_name or "—",
++                    lead.permit.ai_project_classification.value if lead.permit.ai_project_classification else "—",
++                    lead.permit.city,
++                    f"${float(value):,.0f}" if value else "—",
++                    contact,
++                    lead.sla,
++                )
++
++        console.print(top_table)
++
++
++def main():
++    parser = argparse.ArgumentParser(description="TILT Construction Lead Engine")
++    parser.add_argument(
++        "--jurisdiction", "-j",
++        help="Run specific jurisdiction (default: all configured)",
++    )
++    parser.add_argument(
++        "--dry-run",
++        action="store_true",
++        help="Score leads but don't push to GHL",
++    )
++    parser.add_argument(
++        "--since",
++        help="Only fetch permits since date (YYYY-MM-DD)",
++    )
++    parser.add_argument(
++        "--limit",
++        type=int,
++        help="Limit number of permits per jurisdiction",
++    )
++    parser.add_argument(
++        "--scheduled",
++        action="store_true",
++        help="Run on schedule (every 15 minutes)",
++    )
++    parser.add_argument(
++        "--skip-enrichment",
++        action="store_true",
++        help="Skip deep enrichment (entity, skip trace, property, news, contractor)",
++    )
++    parser.add_argument(
++        "--enrich-layers",
++        help="Comma-separated enrichment layers to run (default: all). "
++             "Options: entity,skip_trace,property,news,contractor",
++    )
++    parser.add_argument(
++        "--enrich-concurrency",
++        type=int,
++        default=3,
++        help="Max concurrent enrichment tasks (default: 3)",
++    )
++
++    args = parser.parse_args()
++
++    # Determine jurisdictions
++    if args.jurisdiction:
++        jurisdictions = [args.jurisdiction]
++    else:
++        target = os.getenv("TARGET_JURISDICTIONS", "ct_hartford")
++        jurisdictions = [j.strip() for j in target.split(",")]
++
++    # Parse since date
++    since = None
++    if args.since:
++        since = datetime.strptime(args.since, "%Y-%m-%d")
++    else:
++        since = datetime.utcnow() - timedelta(days=7)  # Default: last 7 days
++
++    # Parse enrichment layers
++    enrich_layers = None
++    if args.enrich_layers:
++        enrich_layers = [l.strip() for l in args.enrich_layers.split(",")]
++
++    if args.scheduled:
++        from apscheduler.schedulers.asyncio import AsyncIOScheduler
++        scheduler = AsyncIOScheduler()
++        interval = int(os.getenv("SCORING_INTERVAL_SECONDS", "900"))
++
++        async def scheduled_run():
++            await run_pipeline(
++                jurisdictions=jurisdictions,
++                since=datetime.utcnow() - timedelta(seconds=interval * 2),
++                dry_run=args.dry_run,
++                limit=args.limit,
++                skip_enrichment=args.skip_enrichment,
++                enrichment_layers=enrich_layers,
++                enrichment_concurrency=args.enrich_concurrency,
++            )
++
++        scheduler.add_job(scheduled_run, "interval", seconds=interval)
++        scheduler.start()
++        logger.info(f"Scheduled mode: running every {interval}s")
++        try:
++            asyncio.get_event_loop().run_forever()
++        except KeyboardInterrupt:
++            scheduler.shutdown()
++    else:
++        asyncio.run(
++            run_pipeline(
++                jurisdictions=jurisdictions,
++                since=since,
++                dry_run=args.dry_run,
++                limit=args.limit,
++                skip_enrichment=args.skip_enrichment,
++                enrichment_layers=enrich_layers,
++                enrichment_concurrency=args.enrich_concurrency,
++            )
++        )
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/lead_engine/scoring.py b/lead_engine/scoring.py
+new file mode 100644
+index 0000000..c7c2406
+--- /dev/null
++++ b/lead_engine/scoring.py
+@@ -0,0 +1,325 @@
++"""
++TILT Lead Scoring Engine
++5-dimension weighted composite scoring model.
++Produces score 0-100 and tier assignment T1-T4.
++"""
++from dataclasses import dataclass, field
++from datetime import date, timedelta
++from decimal import Decimal
++from typing import Optional
++
++from loguru import logger
++
++from openshovels.schema import (
++    StandardPermit, ProjectClassification, PropertyType, PermitStatus
++)
++
++
++@dataclass
++class ScoreComponents:
++    project_fit: float = 0.0       # 0-30 (weight: 30%)
++    borrower_profile: float = 0.0  # 0-25 (weight: 25%)
++    market_strength: float = 0.0   # 0-20 (weight: 20%)
++    timing_signal: float = 0.0     # 0-15 (weight: 15%)
++    conversion_prob: float = 0.0   # 0-10 (weight: 10%)
++
++    @property
++    def composite(self) -> float:
++        return round(
++            self.project_fit +
++            self.borrower_profile +
++            self.market_strength +
++            self.timing_signal +
++            self.conversion_prob,
++            1
++        )
++
++    @property
++    def tier(self) -> int:
++        score = self.composite
++        if score >= 80:
++            return 1  # HOT
++        elif score >= 60:
++            return 2  # WARM
++        elif score >= 40:
++            return 3  # NURTURE
++        else:
++            return 4  # MONITOR
++
++    @property
++    def tier_name(self) -> str:
++        return {1: "HOT", 2: "WARM", 3: "NURTURE", 4: "MONITOR"}[self.tier]
++
++    @property
++    def sla(self) -> str:
++        return {1: "1 hour", 2: "4 hours", 3: "48 hours", 4: "Weekly batch"}[self.tier]
++
++
++@dataclass
++class ScoredLead:
++    """A fully scored lead ready for GHL push."""
++    permit: StandardPermit
++    scores: ScoreComponents
++    composite_score: float = 0.0
++    tier: int = 4
++    tier_name: str = "MONITOR"
++    sla: str = "Weekly batch"
++    scored_at: str = ""
++
++    def __post_init__(self):
++        self.composite_score = self.scores.composite
++        self.tier = self.scores.tier
++        self.tier_name = self.scores.tier_name
++        self.sla = self.scores.sla
++        self.scored_at = date.today().isoformat()
++
++
++# === Market Data (would come from CoStar/Arbor in production) ===
++# Placeholder — replace with API calls or cached data
++MARKET_SCORES = {
++    # city: (rent_growth_pct, vacancy_pct, permit_pipeline_trend)
++    "Hartford": (3.2, 4.8, "declining"),
++    "New Haven": (2.8, 5.1, "stable"),
++    "Stamford": (4.1, 3.2, "declining"),
++    "Bridgeport": (2.1, 6.5, "stable"),
++    "Providence": (3.5, 4.2, "declining"),
++    "Warwick": (2.4, 5.5, "stable"),
++    "Boston": (4.8, 2.9, "increasing"),
++    "Worcester": (3.9, 3.8, "declining"),
++    "Springfield": (1.8, 7.2, "stable"),
++    # Defaults for unknown markets
++    "_default": (2.5, 5.0, "stable"),
++}
++
++
++def score_project_fit(permit: StandardPermit) -> float:
++    """
++    Score 0-30: How well does this project match TILT criteria?
++    """
++    score = 0.0
++
++    # Unit count (0-8 points)
++    units = permit.unit_count or permit.ai_unit_count_estimated
++    if units:
++        if 1 <= units <= 4:
++            score += 8.0  # Small multifamily sweet spot
++        elif 5 <= units <= 10:
++            score += 7.0  # Mid multifamily (LARGE tier)
++        elif 11 <= units <= 50:
++            score += 6.0  # Larger multifamily (INSTITUTIONAL tier)
++        elif units > 50:
++            score += 2.0  # Very large — possible but outside core
++
++    # Project classification (0-8 points)
++    classification = permit.ai_project_classification
++    if classification == ProjectClassification.GROUND_UP:
++        score += 8.0
++    elif classification == ProjectClassification.HEAVY_REHAB:
++        score += 7.0
++    elif classification == ProjectClassification.GUT_RENOVATION:
++        score += 6.0
++    elif classification == ProjectClassification.MODERATE_REHAB:
++        score += 3.0
++
++    # Value range (0-8 points) — all tiers $2M-$100M qualify
++    value = permit.ai_value_estimated or permit.job_value
++    if value:
++        val = float(value)
++        if 5_000_000 <= val <= 15_000_000:
++            score += 8.0  # CORE — sweet spot
++        elif 2_000_000 <= val < 5_000_000:
++            score += 7.0  # SMALL — bread and butter rehab
++        elif 15_000_000 < val <= 50_000_000:
++            score += 7.0  # LARGE — bigger multifamily/mixed
++        elif 50_000_000 < val <= 100_000_000:
++            score += 6.0  # INSTITUTIONAL — fewer but huge fees
++        elif 1_000_000 <= val < 2_000_000:
++            score += 2.0  # Below minimum but worth watching
++
++    # NOO confirmation (0-3 points)
++    if permit.ai_is_investor_noo is True:
++        score += 3.0
++    elif permit.ai_is_investor_noo is None:
++        score += 1.0  # Unknown — partial credit
++
++    # Permit status (0-3 points)
++    if permit.permit_status == PermitStatus.APPROVED:
++        score += 3.0
++    elif permit.permit_status == PermitStatus.ACTIVE:
++        score += 2.5
++    elif permit.permit_status == PermitStatus.FILED:
++        score += 1.5
++
++    return min(score, 30.0)
++
++
++def score_borrower_profile(permit: StandardPermit) -> float:
++    """
++    Score 0-25: Borrower experience and entity structure.
++    In production, enriched with ATTOM property ownership data.
++    """
++    score = 0.0
++
++    # Entity structure (0-8 points)
++    entity = (permit.owner_entity or permit.owner_name or "").lower()
++    if any(kw in entity for kw in ["llc", "inc", "corp", "lp", "trust", "ventures", "capital", "holdings", "development", "properties", "group", "builders"]):
++        score += 8.0  # Entity = investor
++    elif entity:
++        score += 3.0  # Individual name — might be investor
++
++    # Known portfolio (0-8 points) — requires enrichment
++    # Placeholder: would query ATTOM for # of properties owned by entity
++    # For now, give partial credit if entity looks institutional
++    if any(kw in entity for kw in ["development", "capital", "holdings", "group", "ventures"]):
++        score += 6.0  # Likely experienced
++    elif any(kw in entity for kw in ["llc", "inc", "properties"]):
++        score += 3.0  # Likely investor, unknown experience
++
++    # Contractor relationship (0-5 points)
++    if permit.contractor_name:
++        score += 3.0  # Has contractor = more serious
++    if permit.architect_name:
++        score += 2.0  # Has architect = professional project
++
++    # Geographic concentration (0-4 points)
++    # Placeholder: would check if owner has other permits in same area
++    score += 2.0  # Baseline
++
++    return min(score, 25.0)
++
++
++def score_market_strength(permit: StandardPermit) -> float:
++    """
++    Score 0-20: Location fundamentals.
++    """
++    score = 0.0
++    city = permit.city
++    market = MARKET_SCORES.get(city, MARKET_SCORES["_default"])
++    rent_growth, vacancy, pipeline = market
++
++    # Rent growth (0-7 points)
++    if rent_growth >= 4.0:
++        score += 7.0
++    elif rent_growth >= 3.0:
++        score += 5.0
++    elif rent_growth >= 2.0:
++        score += 3.0
++    else:
++        score += 1.0
++
++    # Vacancy (0-7 points) — lower = better
++    if vacancy <= 3.0:
++        score += 7.0
++    elif vacancy <= 5.0:
++        score += 5.0
++    elif vacancy <= 7.0:
++        score += 3.0
++    else:
++        score += 1.0
++
++    # Permit pipeline trend (0-6 points)
++    if pipeline == "declining":
++        score += 6.0  # Less competition
++    elif pipeline == "stable":
++        score += 3.0
++    else:
++        score += 1.0  # Increasing = more competition
++
++    return min(score, 20.0)
++
++
++def score_timing_signal(permit: StandardPermit) -> float:
++    """
++    Score 0-15: Urgency indicators.
++    """
++    score = 0.0
++    today = date.today()
++
++    # Permit expiration urgency (0-8 points)
++    if permit.expiration_date:
++        days_until_expiry = (permit.expiration_date - today).days
++        if days_until_expiry < 30:
++            score += 8.0  # Critical urgency
++        elif days_until_expiry < 60:
++            score += 6.0
++        elif days_until_expiry < 90:
++            score += 4.0
++        elif days_until_expiry < 180:
++            score += 2.0
++
++    # Recency of permit (0-4 points)
++    permit_date = permit.issued_date or permit.filed_date
++    if permit_date:
++        age_days = (today - permit_date).days
++        if age_days <= 7:
++            score += 4.0   # Brand new
++        elif age_days <= 30:
++            score += 3.0
++        elif age_days <= 90:
++            score += 2.0
++        elif age_days <= 180:
++            score += 1.0
++
++    # Seasonal bonus (0-3 points)
++    month = today.month
++    if month in (2, 3, 4, 5):  # Spring permits → summer build
++        score += 3.0
++    elif month in (6, 7, 8):
++        score += 2.0
++    elif month in (9, 10, 11):
++        score += 1.0
++
++    return min(score, 15.0)
++
++
++def score_conversion_probability(permit: StandardPermit) -> float:
++    """
++    Score 0-10: How likely is this lead to convert?
++    """
++    score = 3.0  # Baseline for permit-triggered leads
++
++    # AI confidence boost
++    if permit.ai_confidence and permit.ai_confidence >= 0.8:
++        score += 2.0
++    elif permit.ai_confidence and permit.ai_confidence >= 0.6:
++        score += 1.0
++
++    # Data completeness boost
++    fields_present = sum([
++        bool(permit.owner_name or permit.owner_entity),
++        bool(permit.contractor_name),
++        bool(permit.job_value or permit.ai_value_estimated),
++        bool(permit.unit_count or permit.ai_unit_count_estimated),
++        bool(permit.ai_is_investor_noo is not None),
++    ])
++    score += min(fields_present, 5) * 1.0  # Up to 5 points for completeness
++
++    return min(score, 10.0)
++
++
++def score_lead(permit: StandardPermit) -> ScoredLead:
++    """Full composite scoring for a single permit."""
++    components = ScoreComponents(
++        project_fit=score_project_fit(permit),
++        borrower_profile=score_borrower_profile(permit),
++        market_strength=score_market_strength(permit),
++        timing_signal=score_timing_signal(permit),
++        conversion_prob=score_conversion_probability(permit),
++    )
++    return ScoredLead(permit=permit, scores=components)
++
++
++def score_batch(permits: list[StandardPermit]) -> list[ScoredLead]:
++    """Score a batch and sort by composite score descending."""
++    scored = [score_lead(p) for p in permits]
++    scored.sort(key=lambda x: x.composite_score, reverse=True)
++
++    # Log tier distribution
++    tiers = {1: 0, 2: 0, 3: 0, 4: 0}
++    for s in scored:
++        tiers[s.tier] += 1
++    logger.info(
++        f"Scored {len(scored)} leads: "
++        f"T1={tiers[1]} T2={tiers[2]} T3={tiers[3]} T4={tiers[4]}"
++    )
++    return scored
+diff --git a/openshovels/__init__.py b/openshovels/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/openshovels/api/__init__.py b/openshovels/api/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/openshovels/ingest/__init__.py b/openshovels/ingest/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/openshovels/jurisdictions/__init__.py b/openshovels/jurisdictions/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/openshovels/jurisdictions/ct_hartford/__init__.py b/openshovels/jurisdictions/ct_hartford/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/openshovels/jurisdictions/ct_hartford/scraper.py b/openshovels/jurisdictions/ct_hartford/scraper.py
+new file mode 100644
+index 0000000..036990d
+--- /dev/null
++++ b/openshovels/jurisdictions/ct_hartford/scraper.py
+@@ -0,0 +1,201 @@
++"""
++OpenShovels — Hartford, CT Jurisdiction Scraper
++Source: Hartford Open Data Portal (Socrata)
++Dataset: Building Permits
++"""
++from datetime import date, datetime
++from decimal import Decimal
++from typing import Optional
++
++import httpx
++from loguru import logger
++
++from openshovels.schema import (
++    StandardPermit, PermitType, PermitStatus, PropertyType, DataSource
++)
++from openshovels.jurisdictions.template.base import JurisdictionScraper
++
++
++# Hartford open data — adjust dataset ID after confirming on data.hartford.gov
++HARTFORD_SOCRATA_DOMAIN = "data.hartford.gov"
++HARTFORD_DATASET_ID = "building-permits"  # Placeholder — verify actual ID
++SOCRATA_APP_TOKEN = None  # Optional, increases rate limit
++
++
++class HartfordScraper(JurisdictionScraper):
++    jurisdiction_code = "ct_hartford"
++    jurisdiction_name = "Hartford, CT"
++    data_source_url = f"https://{HARTFORD_SOCRATA_DOMAIN}/resource/{HARTFORD_DATASET_ID}.json"
++    data_source_type = "socrata"
++
++    async def fetch_permits(
++        self,
++        since: Optional[datetime] = None,
++        limit: Optional[int] = None,
++    ) -> list[dict]:
++        """Fetch from Hartford's Socrata open data API."""
++        params = {
++            "$limit": limit or 10000,
++            "$order": "issue_date DESC",
++        }
++        if since:
++            params["$where"] = f"issue_date > '{since.strftime('%Y-%m-%dT%H:%M:%S')}'"
++        
++        headers = {}
++        if SOCRATA_APP_TOKEN:
++            headers["X-App-Token"] = SOCRATA_APP_TOKEN
++
++        async with httpx.AsyncClient(timeout=60) as client:
++            # Try Socrata endpoint first
++            try:
++                resp = await client.get(self.data_source_url, params=params, headers=headers)
++                resp.raise_for_status()
++                data = resp.json()
++                logger.info(f"[ct_hartford] Socrata returned {len(data)} records")
++                return data
++            except httpx.HTTPError as e:
++                logger.warning(f"[ct_hartford] Socrata failed: {e}")
++
++            # Fallback: CT statewide open data
++            fallback_url = "https://data.ct.gov/resource/building-permits.json"
++            try:
++                params["$where"] = (
++                    f"city = 'HARTFORD'" +
++                    (f" AND issue_date > '{since.strftime('%Y-%m-%dT%H:%M:%S')}'" if since else "")
++                )
++                resp = await client.get(fallback_url, params=params, headers=headers)
++                resp.raise_for_status()
++                data = resp.json()
++                logger.info(f"[ct_hartford] CT statewide fallback returned {len(data)} records")
++                return data
++            except httpx.HTTPError as e:
++                logger.error(f"[ct_hartford] All sources failed: {e}")
++                return []
++
++    def normalize(self, raw: dict) -> StandardPermit:
++        """
++        Normalize Hartford permit data into StandardPermit.
++        Field mapping may need adjustment based on actual Socrata schema.
++        """
++        return StandardPermit(
++            permit_id=raw.get("permit_number", raw.get("permit_no", raw.get("id", "UNKNOWN"))),
++            jurisdiction=self.jurisdiction_code,
++            source=DataSource.OPEN_DATA_PORTAL,
++
++            # Dates
++            filed_date=self._parse_date(raw.get("application_date")),
++            issued_date=self._parse_date(raw.get("issue_date", raw.get("issued_date"))),
++            expiration_date=self._parse_date(raw.get("expiration_date")),
++
++            # Location
++            address=raw.get("address", raw.get("location", "")),
++            city="Hartford",
++            state="CT",
++            zip_code=raw.get("zip_code", raw.get("zip", "")),
++            latitude=self._parse_float(raw.get("latitude")),
++            longitude=self._parse_float(raw.get("longitude")),
++
++            # Permit details
++            permit_type=self._classify_permit_type(raw),
++            permit_status=self._classify_status(raw),
++            description=raw.get("description", raw.get("work_description", "")),
++            job_value=self._parse_decimal(raw.get("estimated_cost", raw.get("job_value"))),
++
++            # Property
++            property_type=self._classify_property_type(raw),
++            unit_count=self._parse_int(raw.get("units", raw.get("unit_count"))),
++
++            # Parties
++            owner_name=raw.get("owner_name", raw.get("applicant_name")),
++            contractor_name=raw.get("contractor_name", raw.get("contractor")),
++        )
++
++    # === Field Mapping Helpers ===
++
++    @staticmethod
++    def _parse_date(val) -> Optional[date]:
++        if not val:
++            return None
++        try:
++            if "T" in str(val):
++                return datetime.fromisoformat(str(val).replace("Z", "")).date()
++            return date.fromisoformat(str(val)[:10])
++        except (ValueError, TypeError):
++            return None
++
++    @staticmethod
++    def _parse_float(val) -> Optional[float]:
++        try:
++            return float(val) if val else None
++        except (ValueError, TypeError):
++            return None
++
++    @staticmethod
++    def _parse_decimal(val) -> Optional[Decimal]:
++        if not val:
++            return None
++        try:
++            cleaned = str(val).replace("$", "").replace(",", "").strip()
++            return Decimal(cleaned) if cleaned else None
++        except Exception:
++            return None
++
++    @staticmethod
++    def _parse_int(val) -> Optional[int]:
++        try:
++            return int(val) if val else None
++        except (ValueError, TypeError):
++            return None
++
++    def _classify_permit_type(self, raw: dict) -> PermitType:
++        desc = (
++            raw.get("permit_type", "") + " " +
++            raw.get("description", "") + " " +
++            raw.get("work_type", "")
++        ).lower()
++
++        if any(kw in desc for kw in ["new construct", "new build", "ground up", "new dwelling"]):
++            return PermitType.NEW_CONSTRUCTION
++        if any(kw in desc for kw in ["demolit", "raze", "tear down"]):
++            return PermitType.DEMOLITION
++        if any(kw in desc for kw in ["renovati", "rehab", "remodel", "alteration", "gut"]):
++            return PermitType.RENOVATION
++        if any(kw in desc for kw in ["addition", "extend", "expand"]):
++            return PermitType.ADDITION
++        return PermitType.OTHER
++
++    def _classify_status(self, raw: dict) -> PermitStatus:
++        status = (raw.get("status", raw.get("permit_status", ""))).lower()
++        mapping = {
++            "filed": PermitStatus.FILED, "pending": PermitStatus.FILED,
++            "approved": PermitStatus.APPROVED, "issued": PermitStatus.APPROVED,
++            "active": PermitStatus.ACTIVE, "in progress": PermitStatus.ACTIVE,
++            "final": PermitStatus.FINAL, "complete": PermitStatus.FINAL,
++            "closed": PermitStatus.FINAL,
++            "expired": PermitStatus.EXPIRED, "void": PermitStatus.REVOKED,
++        }
++        for keyword, permit_status in mapping.items():
++            if keyword in status:
++                return permit_status
++        return PermitStatus.FILED
++
++    def _classify_property_type(self, raw: dict) -> PropertyType:
++        desc = (
++            raw.get("property_type", "") + " " +
++            raw.get("description", "") + " " +
++            raw.get("use_type", "")
++        ).lower()
++
++        if any(kw in desc for kw in ["single", "1 family", "one family", "sfr"]):
++            return PropertyType.SINGLE_FAMILY
++        if any(kw in desc for kw in ["duplex", "2 family", "two family", "2-unit"]):
++            return PropertyType.DUPLEX
++        if any(kw in desc for kw in ["triplex", "3 family", "three family", "3-unit"]):
++            return PropertyType.TRIPLEX
++        if any(kw in desc for kw in ["fourplex", "4 family", "four family", "4-unit", "quadplex"]):
++            return PropertyType.FOURPLEX
++        if any(kw in desc for kw in ["multi", "5+", "apartment", "condo"]):
++            return PropertyType.MULTI_5PLUS
++        if any(kw in desc for kw in ["mixed", "retail", "commercial residential"]):
++            return PropertyType.MIXED_USE
++        return PropertyType.UNKNOWN
+diff --git a/openshovels/jurisdictions/template/__init__.py b/openshovels/jurisdictions/template/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/openshovels/jurisdictions/template/base.py b/openshovels/jurisdictions/template/base.py
+new file mode 100644
+index 0000000..5e32f88
+--- /dev/null
++++ b/openshovels/jurisdictions/template/base.py
+@@ -0,0 +1,87 @@
++"""
++OpenShovels — Jurisdiction Base Class
++Every jurisdiction scraper inherits from this.
++"""
++import abc
++from datetime import datetime
++from typing import Optional
++from loguru import logger
++from openshovels.schema import StandardPermit, PermitBatch, DataSource
++
++
++class JurisdictionScraper(abc.ABC):
++    """
++    Base class for jurisdiction-specific scrapers.
++    
++    To add a new jurisdiction:
++    1. Create a folder: jurisdictions/<state>_<city>/
++    2. Create scraper.py inheriting this class
++    3. Implement fetch_permits() and normalize()
++    4. Add to config/jurisdictions.yaml
++    """
++
++    jurisdiction_code: str = ""  # e.g. "ct_hartford"
++    jurisdiction_name: str = ""  # e.g. "Hartford, CT"
++    data_source_url: str = ""    # e.g. Socrata endpoint
++    data_source_type: str = ""   # "socrata", "arcgis", "html", "csv"
++
++    @abc.abstractmethod
++    async def fetch_permits(
++        self,
++        since: Optional[datetime] = None,
++        limit: Optional[int] = None,
++    ) -> list[dict]:
++        """
++        Fetch raw permit records from the jurisdiction.
++        Returns list of raw dicts (jurisdiction-specific format).
++        If `since` is provided, only fetch permits updated after that date.
++        """
++        ...
++
++    @abc.abstractmethod
++    def normalize(self, raw: dict) -> StandardPermit:
++        """
++        Normalize a single raw permit record into StandardPermit schema.
++        This is where jurisdiction-specific field mapping happens.
++        """
++        ...
++
++    async def run(
++        self,
++        since: Optional[datetime] = None,
++        limit: Optional[int] = None,
++    ) -> PermitBatch:
++        """Full ingestion run: fetch → normalize → return batch."""
++        logger.info(f"[{self.jurisdiction_code}] Starting ingestion...")
++
++        raw_records = await self.fetch_permits(since=since, limit=limit)
++        logger.info(f"[{self.jurisdiction_code}] Fetched {len(raw_records)} raw records")
++
++        permits = []
++        errors = 0
++        for raw in raw_records:
++            try:
++                permit = self.normalize(raw)
++                permit.source = DataSource.JURISDICTION_RAW
++                permit.jurisdiction = self.jurisdiction_code
++                permits.append(permit)
++            except Exception as e:
++                errors += 1
++                if errors <= 5:
++                    logger.warning(
++                        f"[{self.jurisdiction_code}] Normalize error: {e} | "
++                        f"Raw: {str(raw)[:200]}"
++                    )
++
++        logger.info(
++            f"[{self.jurisdiction_code}] Normalized {len(permits)} permits "
++            f"({errors} errors)"
++        )
++
++        return PermitBatch(
++            jurisdiction=self.jurisdiction_code,
++            record_count=len(raw_records),
++            new_records=len(permits),  # Updated after DB dedup
++            updated_records=0,
++            permits=permits,
++        )
+diff --git a/openshovels/pipeline/__init__.py b/openshovels/pipeline/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/openshovels/pipeline/enrich.py b/openshovels/pipeline/enrich.py
+new file mode 100644
+index 0000000..64a1f29
+--- /dev/null
++++ b/openshovels/pipeline/enrich.py
+@@ -0,0 +1,170 @@
++"""
++OpenShovels — AI Enrichment Pipeline
++Uses Grok ($0.20/M tokens) for permit classification/tagging.
++Uses Claude for compliance-critical lead scoring (via lead_engine).
++"""
++import json
++from decimal import Decimal
++from typing import Optional
++
++from loguru import logger
++from openai import AsyncOpenAI
++
++from openshovels.schema import (
++    StandardPermit, ProjectClassification, PropertyType
++)
++
++
++# Grok via OpenAI-compatible API
++GROK_BASE_URL = "https://api.x.ai/v1"
++
++CLASSIFICATION_PROMPT = """You are a building permit classifier for a construction lending company.
++Analyze the permit and return ONLY a JSON object (no markdown, no explanation).
++
++Permit data:
++- Description: {description}
++- Type: {permit_type}
++- Address: {address}, {city}, {state}
++- Stated value: {job_value}
++- Owner: {owner_name}
++- Unit count (if stated): {unit_count}
++
++Return JSON:
++{{
++  "project_classification": "ground_up|heavy_rehab|moderate_rehab|gut_renovation|cosmetic|systems_only|not_construction",
++  "estimated_unit_count": <int or null>,
++  "estimated_value_usd": <int or null>,
++  "is_investor_noo": <true|false|null>,
++  "confidence": <0.0-1.0>,
++  "tags": ["tag1", "tag2"],
++  "reasoning": "<one sentence>"
++}}
++
++Rules:
++- "ground_up" = new building from scratch or after demolition
++- "heavy_rehab" = structural changes, >50% of building affected, >$500K
++- "is_investor_noo" = true if owner name looks like LLC/Corp/Trust, or if address differs from owner
++- Include tags like: "multifamily", "luxury", "affordable", "mixed_use", "commercial_component"
++"""
++
++
++class PermitEnricher:
++    """AI-powered permit classification and enrichment."""
++
++    def __init__(self, api_key: str, model: str = "grok-3-mini"):
++        self.client = AsyncOpenAI(
++            api_key=api_key,
++            base_url=GROK_BASE_URL,
++        )
++        self.model = model
++
++    async def enrich_permit(self, permit: StandardPermit) -> StandardPermit:
++        """Classify and enrich a single permit using AI."""
++        try:
++            prompt = CLASSIFICATION_PROMPT.format(
++                description=permit.description or "N/A",
++                permit_type=permit.permit_type.value,
++                address=permit.address,
++                city=permit.city,
++                state=permit.state,
++                job_value=str(permit.job_value) if permit.job_value else "N/A",
++                owner_name=permit.owner_name or "N/A",
++                unit_count=permit.unit_count or "N/A",
++            )
++
++            response = await self.client.chat.completions.create(
++                model=self.model,
++                messages=[{"role": "user", "content": prompt}],
++                max_tokens=300,
++                temperature=0.1,
++            )
++
++            text = response.choices[0].message.content.strip()
++            # Strip markdown fences if present
++            text = text.replace("```json", "").replace("```", "").strip()
++            result = json.loads(text)
++
++            # Apply AI classifications
++            permit.ai_project_classification = self._map_classification(
++                result.get("project_classification", "not_construction")
++            )
++            permit.ai_unit_count_estimated = result.get("estimated_unit_count")
++            permit.ai_value_estimated = (
++                Decimal(str(result["estimated_value_usd"]))
++                if result.get("estimated_value_usd")
++                else None
++            )
++            permit.ai_is_investor_noo = result.get("is_investor_noo")
++            permit.ai_confidence = result.get("confidence", 0.0)
++            permit.ai_tags = result.get("tags", [])
++            permit.source = "ai_enriched"
++
++            # Update unit count if AI found it and we didn't have it
++            if not permit.unit_count and permit.ai_unit_count_estimated:
++                permit.unit_count = permit.ai_unit_count_estimated
++
++            # Update property type based on unit count
++            if permit.ai_unit_count_estimated:
++                permit.property_type = self._unit_count_to_type(
++                    permit.ai_unit_count_estimated
++                )
++
++        except json.JSONDecodeError as e:
++            logger.warning(f"AI JSON parse error for {permit.permit_id}: {e}")
++        except Exception as e:
++            logger.warning(f"AI enrichment failed for {permit.permit_id}: {e}")
++
++        return permit
++
++    async def enrich_batch(
++        self,
++        permits: list[StandardPermit],
++        concurrency: int = 5,
++    ) -> list[StandardPermit]:
++        """Enrich a batch of permits with rate limiting."""
++        import asyncio
++
++        semaphore = asyncio.Semaphore(concurrency)
++        enriched = []
++
++        async def _enrich_with_limit(p):
++            async with semaphore:
++                return await self.enrich_permit(p)
++
++        tasks = [_enrich_with_limit(p) for p in permits]
++        results = await asyncio.gather(*tasks, return_exceptions=True)
++
++        for result in results:
++            if isinstance(result, StandardPermit):
++                enriched.append(result)
++            elif isinstance(result, Exception):
++                logger.error(f"Batch enrichment error: {result}")
++
++        logger.info(f"Enriched {len(enriched)}/{len(permits)} permits")
++        return enriched
++
++    @staticmethod
++    def _map_classification(value: str) -> ProjectClassification:
++        mapping = {
++            "ground_up": ProjectClassification.GROUND_UP,
++            "heavy_rehab": ProjectClassification.HEAVY_REHAB,
++            "moderate_rehab": ProjectClassification.MODERATE_REHAB,
++            "gut_renovation": ProjectClassification.GUT_RENOVATION,
++            "cosmetic": ProjectClassification.COSMETIC,
++            "systems_only": ProjectClassification.SYSTEMS_ONLY,
++        }
++        return mapping.get(value, ProjectClassification.NOT_CONSTRUCTION)
++
++    @staticmethod
++    def _unit_count_to_type(units: int) -> PropertyType:
++        if units == 1:
++            return PropertyType.SINGLE_FAMILY
++        elif units == 2:
++            return PropertyType.DUPLEX
++        elif units == 3:
++            return PropertyType.TRIPLEX
++        elif units == 4:
++            return PropertyType.FOURPLEX
++        elif units >= 5:
++            return PropertyType.MULTI_5PLUS
++        return PropertyType.UNKNOWN
+diff --git a/openshovels/schema.py b/openshovels/schema.py
+new file mode 100644
+index 0000000..db4e087
+--- /dev/null
++++ b/openshovels/schema.py
+@@ -0,0 +1,261 @@
++"""
++OpenShovels — Standardized Permit Schema v2
++Extended with enrichment data models for entity resolution, skip trace,
++property intelligence, news intel, and contractor reverse lookup.
++"""
++from datetime import date, datetime
++from decimal import Decimal
++from enum import Enum
++from typing import Optional
++from pydantic import BaseModel, Field
++
++
++# ── Permit Enums ──────────────────────────────────────────────────────
++
++class PermitType(str, Enum):
++    NEW_CONSTRUCTION = "new_construction"
++    DEMOLITION = "demolition"
++    RENOVATION = "renovation"
++    ADDITION = "addition"
++    MECHANICAL = "mechanical"
++    ELECTRICAL = "electrical"
++    PLUMBING = "plumbing"
++    OTHER = "other"
++
++
++class PermitStatus(str, Enum):
++    FILED = "filed"
++    APPROVED = "approved"
++    ACTIVE = "active"
++    FINAL = "final"
++    EXPIRED = "expired"
++    REVOKED = "revoked"
++
++
++class PropertyType(str, Enum):
++    SINGLE_FAMILY = "single_family"
++    DUPLEX = "duplex"
++    TRIPLEX = "triplex"
++    FOURPLEX = "fourplex"
++    MULTI_5PLUS = "multi_5plus"
++    MIXED_USE = "mixed_use"
++    COMMERCIAL = "commercial"
++    UNKNOWN = "unknown"
++
++
++class ProjectClassification(str, Enum):
++    GROUND_UP = "ground_up"
++    HEAVY_REHAB = "heavy_rehab"
++    MODERATE_REHAB = "moderate_rehab"
++    GUT_RENOVATION = "gut_renovation"
++    COSMETIC = "cosmetic"
++    SYSTEMS_ONLY = "systems_only"
++    NOT_CONSTRUCTION = "not_construction"
++
++
++class DataSource(str, Enum):
++    JURISDICTION_RAW = "jurisdiction_raw"
++    OPEN_DATA_PORTAL = "open_data_portal"
++    AI_ENRICHED = "ai_enriched"
++    MANUAL_ENTRY = "manual_entry"
++
++
++# ── Enrichment Data Models ────────────────────────────────────────────
++
++class EntityRecord(BaseModel):
++    """Result of Secretary of State / OpenCorporates lookup."""
++    entity_name: str
++    entity_type: Optional[str] = None
++    state_of_formation: Optional[str] = None
++    formation_date: Optional[date] = None
++    status: Optional[str] = None
++    registered_agent_name: Optional[str] = None
++    registered_agent_address: Optional[str] = None
++    principal_office_address: Optional[str] = None
++    principals: list[str] = Field(default_factory=list)
++    related_entities: list[str] = Field(default_factory=list)
++    sos_filing_number: Optional[str] = None
++    sos_url: Optional[str] = None
++    other_properties_count: Optional[int] = None
++    lookup_source: Optional[str] = None
++    lookup_timestamp: Optional[datetime] = None
++
++
++class SkipTraceResult(BaseModel):
++    """Contact info from skip trace services."""
++    person_name: str
++    first_name: Optional[str] = None
++    last_name: Optional[str] = None
++    phones: list[dict] = Field(default_factory=list)
++    emails: list[str] = Field(default_factory=list)
++    mailing_address: Optional[str] = None
++    mailing_city: Optional[str] = None
++    mailing_state: Optional[str] = None
++    mailing_zip: Optional[str] = None
++    age: Optional[str] = None
++    relatives: list[dict] = Field(default_factory=list)
++    associates: list[dict] = Field(default_factory=list)
++    previous_addresses: list[dict] = Field(default_factory=list)
++    linkedin_url: Optional[str] = None
++    confidence_score: Optional[float] = None
++    dnc_checked: bool = False
++    skip_trace_source: Optional[str] = None
++    skip_trace_timestamp: Optional[datetime] = None
++
++
++class PropertyIntelligence(BaseModel):
++    """Property data from ATTOM/assessor/Zillow."""
++    property_address: str
++    owner_name: Optional[str] = None
++    owner_mailing_address: Optional[str] = None
++    assessed_value: Optional[Decimal] = None
++    market_value: Optional[Decimal] = None
++    last_sale_date: Optional[date] = None
++    last_sale_price: Optional[Decimal] = None
++    mortgage_amount: Optional[Decimal] = None
++    mortgage_lender: Optional[str] = None
++    equity_estimate: Optional[Decimal] = None
++    year_built: Optional[int] = None
++    lot_size_sqft: Optional[int] = None
++    building_sqft: Optional[int] = None
++    zoning: Optional[str] = None
++    tax_amount: Optional[Decimal] = None
++    rental_estimate: Optional[Decimal] = None
++    arv_estimate: Optional[Decimal] = None
++    neighborhood_median_price: Optional[Decimal] = None
++    days_on_market_avg: Optional[int] = None
++    data_source: Optional[str] = None
++    lookup_timestamp: Optional[datetime] = None
++
++
++class NewsHit(BaseModel):
++    """A single news article or public record hit."""
++    title: str
++    source: str
++    url: Optional[str] = None
++    published_date: Optional[date] = None
++    snippet: Optional[str] = None
++    sentiment: Optional[str] = None
++    category: Optional[str] = None
++
++
++class NewsIntelligence(BaseModel):
++    """Aggregated news and public record search results."""
++    search_query: str
++    total_hits: int = 0
++    articles: list[NewsHit] = Field(default_factory=list)
++    has_zoning_issues: bool = False
++    has_community_opposition: bool = False
++    has_tax_incentives: bool = False
++    has_litigation: bool = False
++    court_cases: list[dict] = Field(default_factory=list)
++    ai_summary: Optional[str] = None
++    search_timestamp: Optional[datetime] = None
++
++
++class ContractorProfile(BaseModel):
++    """Contractor intelligence from reverse permit lookup."""
++    contractor_name: str
++    contractor_license: Optional[str] = None
++    active_permits_count: int = 0
++    total_permit_value: Optional[Decimal] = None
++    jurisdictions_active: list[str] = Field(default_factory=list)
++    recent_projects: list[dict] = Field(default_factory=list)
++    other_clients: list[str] = Field(default_factory=list)
++    referral_potential: Optional[str] = None
++    lookup_timestamp: Optional[datetime] = None
++
++
++class EnrichmentBundle(BaseModel):
++    """All enrichment data for a single permit/lead."""
++    permit_id: str
++    entity: Optional[EntityRecord] = None
++    skip_trace: Optional[SkipTraceResult] = None
++    property_intel: Optional[PropertyIntelligence] = None
++    news_intel: Optional[NewsIntelligence] = None
++    contractor: Optional[ContractorProfile] = None
++    enrichment_cost_usd: float = 0.0
++    enrichment_timestamp: Optional[datetime] = None
++    enrichment_layers_completed: list[str] = Field(default_factory=list)
++
++    @property
++    def has_contact_info(self) -> bool:
++        if not self.skip_trace:
++            return False
++        return bool(self.skip_trace.phones or self.skip_trace.emails)
++
++    @property
++    def noo_confirmed(self) -> bool:
++        if self.property_intel and self.property_intel.owner_mailing_address:
++            return True
++        if self.entity and self.entity.entity_type in ("LLC", "Corp", "LP", "Trust"):
++            return True
++        return False
++
++
++# ── Standard Permit v2 ────────────────────────────────────────────────
++
++class StandardPermit(BaseModel):
++    """Canonical permit record — all jurisdictions normalize to this."""
++    permit_id: str = Field(description="Jurisdiction-issued permit number")
++    jurisdiction: str = Field(description="Jurisdiction code")
++    source: DataSource = DataSource.JURISDICTION_RAW
++
++    filed_date: Optional[date] = None
++    issued_date: Optional[date] = None
++    expiration_date: Optional[date] = None
++    last_inspection_date: Optional[date] = None
++    ingested_at: datetime = Field(default_factory=lambda: datetime.now())
++
++    address: str
++    city: str
++    state: str
++    zip_code: Optional[str] = None
++    county: Optional[str] = None
++    latitude: Optional[float] = None
++    longitude: Optional[float] = None
++    parcel_id: Optional[str] = None
++
++    permit_type: PermitType = PermitType.OTHER
++    permit_status: PermitStatus = PermitStatus.FILED
++    description: Optional[str] = None
++    job_value: Optional[Decimal] = None
++
++    property_type: PropertyType = PropertyType.UNKNOWN
++    unit_count: Optional[int] = None
++    square_footage: Optional[int] = None
++    stories: Optional[int] = None
++
++    owner_name: Optional[str] = None
++    owner_entity: Optional[str] = None
++    contractor_name: Optional[str] = None
++    contractor_license: Optional[str] = None
++    architect_name: Optional[str] = None
++
++    ai_project_classification: Optional[ProjectClassification] = None
++    ai_unit_count_estimated: Optional[int] = None
++    ai_value_estimated: Optional[Decimal] = None
++    ai_is_investor_noo: Optional[bool] = None
++    ai_confidence: Optional[float] = None
++    ai_tags: list[str] = Field(default_factory=list)
++
++    tilt_qualified: Optional[bool] = None
++    tilt_disqualify_reason: Optional[str] = None
++
++    enrichment: Optional[EnrichmentBundle] = None
++
++    class Config:
++        json_encoders = {
++            Decimal: lambda v: float(v),
++            date: lambda v: v.isoformat(),
++            datetime: lambda v: v.isoformat(),
++        }
++
++
++class PermitBatch(BaseModel):
++    jurisdiction: str
++    ingested_at: datetime = Field(default_factory=lambda: datetime.now())
++    record_count: int
++    new_records: int
++    updated_records: int
++    permits: list[StandardPermit]
+diff --git a/openshovels/storage/__init__.py b/openshovels/storage/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/openshovels/utils/__init__.py b/openshovels/utils/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/requirements.txt b/requirements.txt
+new file mode 100644
+index 0000000..be4c5c5
+--- /dev/null
++++ b/requirements.txt
+@@ -0,0 +1,32 @@
++scrapy>=2.11
++playwright>=1.40
++requests>=2.31
++beautifulsoup4>=4.12
++sodapy>=2.2
++aiohttp>=3.9
++langchain>=0.2
++langchain-community>=0.2
++openai>=1.12
++anthropic>=0.25
++psycopg2-binary>=2.9
++duckdb>=0.10
++sqlalchemy>=2.0
++alembic>=1.13
++fastapi>=0.110
++uvicorn>=0.27
++pydantic>=2.6
++pandas>=2.2
++polars>=0.20
++numpy>=1.26
++geopy>=2.4
++httpx>=0.27
++tenacity>=8.2
++phonenumbers>=8.13
++email-validator>=2.1
++apscheduler>=3.10
++pytest>=8.0
++pytest-asyncio>=0.23
++faker>=22.0
++python-dotenv>=1.0
++rich>=13.7
++loguru>=0.7
+diff --git a/scripts/__init__.py b/scripts/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/scripts/setup_ghl.py b/scripts/setup_ghl.py
+new file mode 100644
+index 0000000..1a9c514
+--- /dev/null
++++ b/scripts/setup_ghl.py
+@@ -0,0 +1,282 @@
++"""
++GHL Setup Script — Run once to configure GoHighLevel for TILT Lead Engine
++
++Creates:
++1. TILT Construction Lending pipeline with 8 stages
++2. 30+ custom fields across 5 groups  
++3. Webhook subscriptions for real-time events
++
++Prerequisites:
++- GHL Private Integration Token with required scopes
++- GHL_PRIVATE_TOKEN and GHL_LOCATION_ID in config/.env
++
++Usage:
++    python scripts/setup_ghl.py
++    python scripts/setup_ghl.py --dry-run  # Preview without creating
++"""
++import asyncio
++import os
++import sys
++import json
++
++from dotenv import load_dotenv
++import httpx
++from rich.console import Console
++from rich.table import Table
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
++load_dotenv("config/.env")
++
++console = Console()
++
++BASE_URL = "https://services.leadconnectorhq.com"
++TOKEN = os.getenv("GHL_PRIVATE_TOKEN")
++LOCATION_ID = os.getenv("GHL_LOCATION_ID")
++VERSION = "2021-07-28"
++
++HEADERS = {
++    "Authorization": f"Bearer {TOKEN}",
++    "Content-Type": "application/json",
++    "Version": VERSION,
++}
++
++# ============================================================================
++# PIPELINE DEFINITION
++# ============================================================================
++
++PIPELINE = {
++    "name": "TILT Construction Lending",
++    "stages": [
++        {"name": "Permit Detected", "position": 0},
++        {"name": "AI Qualified", "position": 1},
++        {"name": "First Contact", "position": 2},
++        {"name": "Engaged", "position": 3},
++        {"name": "Application", "position": 4},
++        {"name": "Underwriting", "position": 5},
++        {"name": "Approved / CTC", "position": 6},
++        {"name": "Funded", "position": 7},
++    ],
++}
++
++# ============================================================================
++# CUSTOM FIELDS
++# ============================================================================
++
++CUSTOM_FIELDS = [
++    # Lead Intelligence
++    {"name": "composite_score", "dataType": "NUMERICAL", "model": "contact"},
++    {"name": "lead_tier", "dataType": "SINGLE_OPTIONS", "model": "contact",
++     "options": ["T1-HOT", "T2-WARM", "T3-NURTURE", "T4-MONITOR"]},
++    {"name": "lead_source_detail", "dataType": "TEXT", "model": "contact"},
++    {"name": "scoring_timestamp", "dataType": "DATE", "model": "contact"},
++    {"name": "decay_adjusted_score", "dataType": "NUMERICAL", "model": "contact"},
++
++    # Project Details
++    {"name": "project_type", "dataType": "SINGLE_OPTIONS", "model": "contact",
++     "options": ["Ground-Up", "Heavy Rehab", "Moderate Rehab", "Gut Renovation"]},
++    {"name": "unit_count", "dataType": "NUMERICAL", "model": "contact"},
++    {"name": "property_address", "dataType": "TEXT", "model": "contact"},
++    {"name": "estimated_project_value", "dataType": "MONETARY", "model": "contact"},
++    {"name": "owner_occupied", "dataType": "SINGLE_OPTIONS", "model": "contact",
++     "options": ["Non-Owner-Occupied", "Owner-Occupied", "Unknown"]},
++
++    # Permit Data
++    {"name": "permit_number", "dataType": "TEXT", "model": "contact"},
++    {"name": "permit_type", "dataType": "TEXT", "model": "contact"},
++    {"name": "permit_status", "dataType": "SINGLE_OPTIONS", "model": "contact",
++     "options": ["Filed", "Approved", "Active", "Final", "Expired"]},
++    {"name": "permit_value", "dataType": "MONETARY", "model": "contact"},
++    {"name": "permit_date", "dataType": "DATE", "model": "contact"},
++    {"name": "permit_expiration", "dataType": "DATE", "model": "contact"},
++
++    # Borrower Profile
++    {"name": "entity_name", "dataType": "TEXT", "model": "contact"},
++    {"name": "portfolio_size", "dataType": "NUMERICAL", "model": "contact"},
++    {"name": "completed_projects", "dataType": "NUMERICAL", "model": "contact"},
++    {"name": "existing_loan_maturity", "dataType": "DATE", "model": "contact"},
++    {"name": "borrower_experience_tier", "dataType": "SINGLE_OPTIONS", "model": "contact",
++     "options": ["First-Time", "Experienced (3-10)", "Institutional (10+)"]},
++
++    # Scoring Components
++    {"name": "score_project_fit", "dataType": "NUMERICAL", "model": "contact"},
++    {"name": "score_borrower", "dataType": "NUMERICAL", "model": "contact"},
++    {"name": "score_market", "dataType": "NUMERICAL", "model": "contact"},
++    {"name": "score_timing", "dataType": "NUMERICAL", "model": "contact"},
++    {"name": "score_conversion", "dataType": "NUMERICAL", "model": "contact"},
++]
++
++# ============================================================================
++# WEBHOOK EVENTS
++# ============================================================================
++
++WEBHOOK_EVENTS = [
++    "ContactCreate",
++    "ContactUpdate",
++    "OpportunityCreate",
++    "OpportunityStageUpdate",
++    "TaskCompleted",
++    "AppointmentScheduled",
++]
++
++
++async def setup_pipeline(dry_run: bool = False) -> dict:
++    """Create the TILT Construction Lending pipeline."""
++    console.rule("[bold]Creating Pipeline")
++
++    # Skip if pipeline already created manually
++    existing_pipeline_id = os.getenv("GHL_PIPELINE_ID", "")
++    if existing_pipeline_id:
++        console.print(f"[green]✓ Pipeline already configured: {existing_pipeline_id} — skipping creation[/green]")
++        return {"pipeline": {"id": existing_pipeline_id}}
++
++    if dry_run:
++        console.print(f"[yellow]DRY RUN: Would create pipeline '{PIPELINE['name']}' with {len(PIPELINE['stages'])} stages[/yellow]")
++        return {}
++
++    async with httpx.AsyncClient(timeout=30) as client:
++        resp = await client.post(
++            f"{BASE_URL}/opportunities/pipelines",
++            json={
++                "locationId": LOCATION_ID,
++                "name": PIPELINE["name"],
++                "stages": PIPELINE["stages"],
++            },
++            headers=HEADERS,
++        )
++
++        if resp.status_code in (200, 201):
++            data = resp.json()
++            pipeline_id = data.get("pipeline", {}).get("id")
++            stages = data.get("pipeline", {}).get("stages", [])
++
++            console.print(f"[green]✓ Pipeline created: {pipeline_id}[/green]")
++
++            # Print stage IDs for .env
++            console.print("\n[bold]Add these to config/.env:[/bold]")
++            stage_names = [
++                "PERMIT_DETECTED", "QUALIFIED", "CONTACTED", "ENGAGED",
++                "APPLICATION", "UNDERWRITING", "APPROVED", "FUNDED"
++            ]
++            console.print(f"GHL_PIPELINE_ID={pipeline_id}")
++            for stage, env_name in zip(stages, stage_names):
++                console.print(f"GHL_STAGE_{env_name}={stage.get('id', '')}")
++
++            return data
++        else:
++            console.print(f"[red]✗ Pipeline creation failed: {resp.status_code} — {resp.text[:200]}[/red]")
++            return {}
++
++
++async def setup_custom_fields(dry_run: bool = False) -> list:
++    """Create all custom fields."""
++    console.rule("[bold]Creating Custom Fields")
++    results = []
++
++    table = Table(title=f"Custom Fields ({len(CUSTOM_FIELDS)} total)")
++    table.add_column("Field", style="cyan")
++    table.add_column("Type", style="green")
++    table.add_column("Status", style="yellow")
++
++    async with httpx.AsyncClient(timeout=30) as client:
++        for field_def in CUSTOM_FIELDS:
++            if dry_run:
++                table.add_row(field_def["name"], field_def["dataType"], "DRY RUN")
++                continue
++
++            payload = {
++                "name": field_def["name"],
++                "dataType": field_def["dataType"],
++                "model": field_def.get("model", "contact"),
++            }
++            if "options" in field_def:
++                payload["options"] = field_def["options"]
++
++            try:
++                resp = await client.post(
++                    f"{BASE_URL}/locations/{LOCATION_ID}/customFields",
++                    json=payload,
++                    headers=HEADERS,
++                )
++
++                if resp.status_code in (200, 201):
++                    data = resp.json()
++                    field_id = data.get("customField", {}).get("id", "—")
++                    table.add_row(field_def["name"], field_def["dataType"], f"✓ {field_id}")
++                    results.append(data)
++                elif resp.status_code == 422:
++                    table.add_row(field_def["name"], field_def["dataType"], "⚠ Already exists")
++                else:
++                    table.add_row(field_def["name"], field_def["dataType"], f"✗ {resp.status_code}")
++
++                # Rate limit: 100 req / 10 seconds
++                await asyncio.sleep(0.15)
++
++            except Exception as e:
++                table.add_row(field_def["name"], field_def["dataType"], f"✗ {e}")
++
++    console.print(table)
++    return results
++
++
++async def setup_webhooks(webhook_url: str, dry_run: bool = False) -> list:
++    """Subscribe to webhook events."""
++    console.rule("[bold]Setting Up Webhooks")
++    results = []
++
++    if not webhook_url:
++        console.print("[yellow]No WEBHOOK_URL configured — skipping[/yellow]")
++        console.print("Set your engine's public URL to receive GHL events")
++        return []
++
++    for event in WEBHOOK_EVENTS:
++        if dry_run:
++            console.print(f"  [yellow]DRY RUN: {event} → {webhook_url}[/yellow]")
++            continue
++
++        console.print(f"  Subscribing: {event} → {webhook_url}")
++
++    return results
++
++
++async def main():
++    import argparse
++    parser = argparse.ArgumentParser(description="Setup GHL for TILT Lead Engine")
++    parser.add_argument("--dry-run", action="store_true", help="Preview without creating")
++    parser.add_argument("--webhook-url", help="Your engine's public webhook URL")
++    args = parser.parse_args()
++
++    if not TOKEN:
++        console.print("[red]ERROR: GHL_PRIVATE_TOKEN not set in config/.env[/red]")
++        console.print("Create one at: GHL Settings → Other Settings → Private Integrations")
++        return
++
++    if not LOCATION_ID:
++        console.print("[red]ERROR: GHL_LOCATION_ID not set in config/.env[/red]")
++        return
++
++    console.print(f"\n[bold]TILT Lead Engine — GHL Setup[/bold]")
++    console.print(f"Location: {LOCATION_ID}")
++    console.print(f"Dry run: {args.dry_run}\n")
++
++    # 1. Pipeline
++    await setup_pipeline(dry_run=args.dry_run)
++
++    # 2. Custom Fields
++    await setup_custom_fields(dry_run=args.dry_run)
++
++    # 3. Webhooks
++    await setup_webhooks(
++        webhook_url=args.webhook_url or "",
++        dry_run=args.dry_run,
++    )
++
++    console.rule("[bold green]SETUP COMPLETE")
++    console.print("\nNext steps:")
++    console.print("1. Copy pipeline + stage IDs into config/.env")
++    console.print("2. Build GHL workflows (see docs/ghl-workflows.md)")
++    console.print("3. Run: python lead_engine/score_and_push.py --dry-run")
++    console.print("4. Verify leads appear in GHL → TILT Construction Lending pipeline")
++
++
++if __name__ == "__main__":
++    asyncio.run(main())
+-- 
+2.43.0
+
