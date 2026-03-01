@@ -1,7 +1,7 @@
 """
 OpenShovels — Hartford, CT Jurisdiction Scraper
-Source: Hartford Open Data Portal (Socrata)
-Dataset: Building Permits
+Source: Hartford Open Data / ArcGIS Feature Server
+Dataset: Building Permits 20200101 to Current (34,194 records)
 """
 from datetime import date, datetime
 from decimal import Decimal
@@ -16,118 +16,122 @@ from openshovels.schema import (
 from openshovels.jurisdictions.template.base import JurisdictionScraper
 
 
-# Hartford open data — adjust dataset ID after confirming on data.hartford.gov
-HARTFORD_SOCRATA_DOMAIN = "data.hartford.gov"
-HARTFORD_DATASET_ID = "building-permits"  # Placeholder — verify actual ID
-SOCRATA_APP_TOKEN = None  # Optional, increases rate limit
+HARTFORD_FEATURE_SERVER = (
+    "https://utility.arcgis.com/usrsvcs/servers/"
+    "d595ae995fb049d3ac54919ebf24b1ac/rest/services/"
+    "HartfordOpenDataTables/FeatureServer/0"
+)
 
 
 class HartfordScraper(JurisdictionScraper):
     jurisdiction_code = "ct_hartford"
     jurisdiction_name = "Hartford, CT"
-    data_source_url = f"https://{HARTFORD_SOCRATA_DOMAIN}/resource/{HARTFORD_DATASET_ID}.json"
-    data_source_type = "socrata"
+    data_source_url = HARTFORD_FEATURE_SERVER
+    data_source_type = "arcgis"
 
     async def fetch_permits(
         self,
         since: Optional[datetime] = None,
         limit: Optional[int] = None,
     ) -> list[dict]:
-        """Fetch from Hartford's Socrata open data API."""
-        params = {
-            "$limit": limit or 10000,
-            "$order": "issue_date DESC",
-        }
+        """Fetch from Hartford's ArcGIS Feature Server."""
+        where = "Total_Construction_Cost > 2000000"
         if since:
-            params["$where"] = f"issue_date > '{since.strftime('%Y-%m-%dT%H:%M:%S')}'"
+            since_str = since.strftime("%Y-%m-%d")
+            where += f" AND DATE_OPENED >= '{since_str}'"
 
-        headers = {}
-        if SOCRATA_APP_TOKEN:
-            headers["X-App-Token"] = SOCRATA_APP_TOKEN
+        result_limit = limit or 2000
+        all_records = []
+        offset = 0
 
-        async with httpx.AsyncClient(timeout=60) as client:
-            # Try Socrata endpoint first
-            try:
-                resp = await client.get(self.data_source_url, params=params, headers=headers)
-                resp.raise_for_status()
-                data = resp.json()
-                logger.info(f"[ct_hartford] Socrata returned {len(data)} records")
-                return data
-            except httpx.HTTPError as e:
-                logger.warning(f"[ct_hartford] Socrata failed: {e}")
+        async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+            while True:
+                params = {
+                    "where": where,
+                    "outFields": "*",
+                    "resultRecordCount": min(result_limit - len(all_records), 2000),
+                    "resultOffset": offset,
+                    "orderByFields": "DATE_OPENED DESC",
+                    "f": "json",
+                }
 
-            # Fallback: CT statewide open data
-            fallback_url = "https://data.ct.gov/resource/building-permits.json"
-            try:
-                params["$where"] = (
-                    f"city = 'HARTFORD'" +
-                    (f" AND issue_date > '{since.strftime('%Y-%m-%dT%H:%M:%S')}'" if since else "")
-                )
-                resp = await client.get(fallback_url, params=params, headers=headers)
-                resp.raise_for_status()
-                data = resp.json()
-                logger.info(f"[ct_hartford] CT statewide fallback returned {len(data)} records")
-                return data
-            except httpx.HTTPError as e:
-                logger.error(f"[ct_hartford] All sources failed: {e}")
-                return []
+                try:
+                    resp = await client.get(
+                        f"{HARTFORD_FEATURE_SERVER}/query",
+                        params=params,
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+
+                    if "error" in data:
+                        logger.error(f"[ct_hartford] ArcGIS error: {data['error']}")
+                        break
+
+                    features = data.get("features", [])
+                    if not features:
+                        break
+
+                    records = [f.get("attributes", {}) for f in features]
+                    all_records.extend(records)
+
+                    logger.info(
+                        f"[ct_hartford] Fetched {len(records)} records "
+                        f"(total: {len(all_records)})"
+                    )
+
+                    if len(all_records) >= result_limit:
+                        break
+                    if not data.get("exceededTransferLimit", False):
+                        break
+
+                    offset += len(records)
+
+                except httpx.HTTPError as e:
+                    logger.error(f"[ct_hartford] ArcGIS fetch failed: {e}")
+                    break
+
+        logger.info(f"[ct_hartford] Total records fetched: {len(all_records)}")
+        return all_records
 
     def normalize(self, raw: dict) -> StandardPermit:
-        """
-        Normalize Hartford permit data into StandardPermit.
-        Field mapping may need adjustment based on actual Socrata schema.
-        """
+        """Normalize Hartford ArcGIS permit data into StandardPermit."""
         return StandardPermit(
-            permit_id=raw.get("permit_number", raw.get("permit_no", raw.get("id", "UNKNOWN"))),
+            permit_id=raw.get("RECORD_ID", "UNKNOWN"),
             jurisdiction=self.jurisdiction_code,
             source=DataSource.OPEN_DATA_PORTAL,
 
-            # Dates
-            filed_date=self._parse_date(raw.get("application_date")),
-            issued_date=self._parse_date(raw.get("issue_date", raw.get("issued_date"))),
-            expiration_date=self._parse_date(raw.get("expiration_date")),
+            filed_date=self._parse_date(raw.get("DATE_OPENED")),
+            issued_date=self._parse_date(raw.get("DateIssued")),
+            expiration_date=self._parse_date(raw.get("DATE_CLOSED")),
 
-            # Location
-            address=raw.get("address", raw.get("location", "")),
-            city="Hartford",
-            state="CT",
-            zip_code=raw.get("zip_code", raw.get("zip", "")),
-            latitude=self._parse_float(raw.get("latitude")),
-            longitude=self._parse_float(raw.get("longitude")),
+            address=raw.get("Location", raw.get("PROPERTY_ADDRESS", "")),
+            city=raw.get("PROPERTY_CITY", "Hartford"),
+            state=raw.get("PROPERTY_STATE", "CT"),
+            zip_code=raw.get("PROPERTY_ZIP", ""),
 
-            # Permit details
             permit_type=self._classify_permit_type(raw),
             permit_status=self._classify_status(raw),
-            description=raw.get("description", raw.get("work_description", "")),
-            job_value=self._parse_decimal(raw.get("estimated_cost", raw.get("job_value"))),
+            description=raw.get("DESCRIPTION") or raw.get("B1_APP_TYPE_ALIAS", ""),
+            job_value=self._parse_decimal(raw.get("Total_Construction_Cost")),
 
-            # Property
             property_type=self._classify_property_type(raw),
-            unit_count=self._parse_int(raw.get("units", raw.get("unit_count"))),
+            unit_count=self._parse_int(raw.get("UNIT")),
 
-            # Parties
-            owner_name=raw.get("owner_name", raw.get("applicant_name")),
-            contractor_name=raw.get("contractor_name", raw.get("contractor")),
+            owner_name=raw.get("ASSIGNED_TO"),
         )
-
-    # === Field Mapping Helpers ===
 
     @staticmethod
     def _parse_date(val) -> Optional[date]:
         if not val:
             return None
         try:
-            if "T" in str(val):
-                return datetime.fromisoformat(str(val).replace("Z", "")).date()
-            return date.fromisoformat(str(val)[:10])
-        except (ValueError, TypeError):
-            return None
-
-    @staticmethod
-    def _parse_float(val) -> Optional[float]:
-        try:
-            return float(val) if val else None
-        except (ValueError, TypeError):
+            s = str(val).strip()
+            if s.isdigit() and len(s) > 10:
+                return datetime.fromtimestamp(int(s) / 1000).date()
+            if "T" in s:
+                return datetime.fromisoformat(s.replace("Z", "")).date()
+            return date.fromisoformat(s[:10])
+        except (ValueError, TypeError, OSError):
             return None
 
     @staticmethod
@@ -136,7 +140,8 @@ class HartfordScraper(JurisdictionScraper):
             return None
         try:
             cleaned = str(val).replace("$", "").replace(",", "").strip()
-            return Decimal(cleaned) if cleaned else None
+            d = Decimal(cleaned) if cleaned else None
+            return d if d and d > 0 else None
         except Exception:
             return None
 
@@ -148,11 +153,11 @@ class HartfordScraper(JurisdictionScraper):
             return None
 
     def _classify_permit_type(self, raw: dict) -> PermitType:
-        desc = (
-            raw.get("permit_type", "") + " " +
-            raw.get("description", "") + " " +
-            raw.get("work_type", "")
-        ).lower()
+        desc = " ".join(filter(None, [
+            raw.get("B1_APP_TYPE_ALIAS", ""),
+            raw.get("RECORD_TYPE_TYPE", ""),
+            raw.get("DESCRIPTION", ""),
+        ])).lower()
 
         if any(kw in desc for kw in ["new construct", "new build", "ground up", "new dwelling"]):
             return PermitType.NEW_CONSTRUCTION
@@ -165,37 +170,35 @@ class HartfordScraper(JurisdictionScraper):
         return PermitType.OTHER
 
     def _classify_status(self, raw: dict) -> PermitStatus:
-        status = (raw.get("status", raw.get("permit_status", ""))).lower()
-        mapping = {
-            "filed": PermitStatus.FILED, "pending": PermitStatus.FILED,
-            "approved": PermitStatus.APPROVED, "issued": PermitStatus.APPROVED,
-            "active": PermitStatus.ACTIVE, "in progress": PermitStatus.ACTIVE,
-            "final": PermitStatus.FINAL, "complete": PermitStatus.FINAL,
-            "closed": PermitStatus.FINAL,
-            "expired": PermitStatus.EXPIRED, "void": PermitStatus.REVOKED,
-        }
-        for keyword, permit_status in mapping.items():
-            if keyword in status:
-                return permit_status
+        status = (raw.get("RECORD_STATUS", "")).lower()
+        if any(kw in status for kw in ["closed - approved", "closed - finaled", "closed - completed"]):
+            return PermitStatus.FINAL
+        if "issued" in status:
+            return PermitStatus.APPROVED
+        if any(kw in status for kw in ["active", "in progress", "in review", "pending"]):
+            return PermitStatus.ACTIVE
+        if "approved" in status:
+            return PermitStatus.APPROVED
+        if any(kw in status for kw in ["expired", "void", "withdrawn", "denied"]):
+            return PermitStatus.EXPIRED
         return PermitStatus.FILED
 
     def _classify_property_type(self, raw: dict) -> PropertyType:
-        desc = (
-            raw.get("property_type", "") + " " +
-            raw.get("description", "") + " " +
-            raw.get("use_type", "")
-        ).lower()
+        desc = " ".join(filter(None, [
+            raw.get("B1_APP_TYPE_ALIAS", ""),
+            raw.get("DESCRIPTION", ""),
+        ])).lower()
 
         if any(kw in desc for kw in ["single", "1 family", "one family", "sfr"]):
             return PropertyType.SINGLE_FAMILY
-        if any(kw in desc for kw in ["duplex", "2 family", "two family", "2-unit"]):
+        if any(kw in desc for kw in ["duplex", "2 family", "two family"]):
             return PropertyType.DUPLEX
-        if any(kw in desc for kw in ["triplex", "3 family", "three family", "3-unit"]):
+        if any(kw in desc for kw in ["triplex", "3 family", "three family"]):
             return PropertyType.TRIPLEX
-        if any(kw in desc for kw in ["fourplex", "4 family", "four family", "4-unit", "quadplex"]):
+        if any(kw in desc for kw in ["fourplex", "4 family", "four family", "quadplex"]):
             return PropertyType.FOURPLEX
         if any(kw in desc for kw in ["multi", "5+", "apartment", "condo"]):
             return PropertyType.MULTI_5PLUS
-        if any(kw in desc for kw in ["mixed", "retail", "commercial residential"]):
+        if any(kw in desc for kw in ["mixed", "retail"]):
             return PropertyType.MIXED_USE
         return PropertyType.UNKNOWN
